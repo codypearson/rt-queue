@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rt-queue"
+version = "0.1.0"
+description = "CLI to list Jira parent tickets ready for Review & Test"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "click>=8.1",
+    "python-dotenv>=1.0",
+    "requests>=2.31",
+]
+
+[project.scripts]
+rt-queue = "rt_queue.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["rt_queue*"]
