@@ -13,11 +13,43 @@ Output is one parent URL per line on stdout (nothing else).
 
 ## Setup
 
+### Install
+
+Install with [pipx](https://pipx.pypa.io/) so `rt-queue` is available globally without activating a virtualenv:
+
+```bash
+pipx install rt-queue
+```
+
+From a clone of this repository:
+
+```bash
+pipx install .
+```
+
+From GitHub (no clone required):
+
+```bash
+pipx install git+https://github.com/codypearson/rt-queue.git
+```
+
+If you do not have pipx yet, see the [pipx installation guide](https://pipx.pypa.io/stable/installation/).
+
+### Configuration
+
 ```bash
 cp .env.example .env
 # Edit .env: JIRA_BASE_URL, JIRA_EMAIL, JIRA_API_TOKEN, JIRA_PROJECT_KEY,
 # and either JIRA_DEPLOY_ISSUE_TYPE_NAME or JIRA_DEPLOY_ISSUE_TYPE_ID
+```
 
+Run `rt-queue` from any directory; it loads `.env` from the current working directory.
+
+### Development
+
+For local development with an editable install:
+
+```bash
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -e .
