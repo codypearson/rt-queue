@@ -88,6 +88,9 @@ def find_parents_needing_rt(
 
     When ``exclude_worked_on_siblings`` is True (default), parents are excluded
     if the current user was ever assignee on any other subtask under that parent.
+    This exclusion is relaxed for historical assignments to Review & Test
+    subtasks that are now in "Done" status: completing a prior R&T subtask
+    on a parent does not disqualify the parent for a subsequent R&T subtask.
     """
     current_account_id = client.get_myself_account_id()
     rt_jql = _build_rt_subtasks_jql(settings)
@@ -123,13 +126,29 @@ def find_parents_needing_rt(
             sibling_jql = _build_sibling_work_jql(batch)
             worked_subtasks = client.search_jql(sibling_jql)
 
-            for subtask in worked_subtasks:
-                parent_key = subtask.parent_key
+            for historical_subtask in worked_subtasks:
+                parent_key = historical_subtask.parent_key
                 if not parent_key or parent_key not in parent_to_rt_key:
                     continue
-                rt_key = parent_to_rt_key[parent_key]
-                if subtask.key != rt_key:
-                    excluded_parents.add(parent_key)
+                rt_subtask_key = parent_to_rt_key[parent_key]
+                if historical_subtask.key == rt_subtask_key:
+                    continue
+
+                # Relaxed worked-on-siblings rule:
+                # Ignore historical assignments to *completed* Review & Test subtasks.
+                # Previously, any assignment (via "assignee was currentUser()") on a
+                # sibling subtask would exclude the parent. Now we allow a fresh R&T
+                # subtask on a parent when prior R&T work on the same parent has been
+                # completed (status "Done").
+                if (
+                    summary_matches_rt(
+                        historical_subtask, settings.jira_rt_summary_contains
+                    )
+                    and is_done_status(historical_subtask)
+                ):
+                    continue
+
+                excluded_parents.add(parent_key)
 
     for batch_start in range(0, len(parent_keys), _PARENT_BATCH_SIZE):
         batch = parent_keys[batch_start : batch_start + _PARENT_BATCH_SIZE]
