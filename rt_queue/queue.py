@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import datetime as dt
+from dataclasses import dataclass
+
 from rt_queue.config import Settings
 from rt_queue.jira_client import (
     JiraClient,
-    JiraSubtask,
+    JiraIssue,
     assignee_is_current_user,
     escape_jql_string,
     is_done_status,
@@ -13,6 +16,22 @@ from rt_queue.jira_client import (
     status_matches,
     summary_matches_rt,
 )
+
+
+@dataclass(frozen=True)
+class ParentReadyForRt:
+    """A parent issue that is ready for Review & Test.
+
+    Attributes:
+        key: The Jira issue key (e.g. PROJ-123).
+        assignee: Display name of the parent assignee, or "Unassigned".
+        last_subtask_completed: The most recent resolution date among the
+            parent's subtasks, or None if none had a resolution date.
+    """
+
+    key: str
+    assignee: str
+    last_subtask_completed: dt.datetime | None
 
 # Batch size for ``parent in (...)`` JQL queries.
 _PARENT_BATCH_SIZE = 50
@@ -54,7 +73,7 @@ def siblings_ready_for_rt(
     client: JiraClient,
     parent_key: str,
     rt_subtask_key: str,
-    siblings: list[JiraSubtask],
+    siblings: list[JiraIssue],
 ) -> bool:
     """
     Return True when every non-Deploy sibling except the R&T subtask is Done.
@@ -79,9 +98,9 @@ def find_parents_needing_rt(
     settings: Settings,
     *,
     exclude_worked_on_siblings: bool = True,
-) -> list[str]:
+) -> list[ParentReadyForRt]:
     """
-    Return parent issue keys ready for Review & Test.
+    Return parent issues ready for Review & Test.
 
     Parents are included when they have an R&T subtask matching configured
     summary/status/assignee rules and every other non-Deploy subtask is Done.
@@ -91,6 +110,10 @@ def find_parents_needing_rt(
     This exclusion is relaxed for historical assignments to Review & Test
     subtasks that are now in "Done" status: completing a prior R&T subtask
     on a parent does not disqualify the parent for a subsequent R&T subtask.
+
+    Results include the parent assignee and the date the last of its subtasks
+    was completed. Results are sorted by last completed subtask date, oldest
+    first.
     """
     current_account_id = client.get_myself_account_id()
     rt_jql = _build_rt_subtasks_jql(settings)
@@ -150,6 +173,9 @@ def find_parents_needing_rt(
 
                 excluded_parents.add(parent_key)
 
+    # Map from parent key to the most recent resolution date among its subtasks.
+    parent_to_last_completed: dict[str, dt.datetime | None] = {}
+
     for batch_start in range(0, len(parent_keys), _PARENT_BATCH_SIZE):
         batch = parent_keys[batch_start : batch_start + _PARENT_BATCH_SIZE]
         siblings_jql = _build_siblings_jql(batch)
@@ -163,9 +189,50 @@ def find_parents_needing_rt(
                 client, parent_key, rt_key, all_siblings
             ):
                 excluded_parents.add(parent_key)
+                continue
 
-    result = [
+            # Determine the latest completion date across all siblings for this parent.
+            max_completed: dt.datetime | None = None
+            for sibling in all_siblings:
+                if sibling.parent_key != parent_key:
+                    continue
+                if sibling.resolution_date is None:
+                    continue
+                if max_completed is None or sibling.resolution_date > max_completed:
+                    max_completed = sibling.resolution_date
+            parent_to_last_completed[parent_key] = max_completed
+
+    final_parent_keys = [
         key for key in parent_keys if key not in excluded_parents
     ]
-    result.sort()
-    return result
+
+    # Fetch assignee display names for the final parents (batched).
+    parent_to_assignee: dict[str, str] = {}
+    for batch_start in range(0, len(final_parent_keys), _PARENT_BATCH_SIZE):
+        batch = final_parent_keys[batch_start : batch_start + _PARENT_BATCH_SIZE]
+        if not batch:
+            continue
+        keys_csv = ", ".join(batch)
+        parent_jql = f"key in ({keys_csv})"
+        parent_issues = client.search_jql(parent_jql)
+        for parent_issue in parent_issues:
+            if parent_issue.key in batch:
+                display_name = parent_issue.assignee_display_name or "Unassigned"
+                parent_to_assignee[parent_issue.key] = display_name
+
+    # Build results and sort by last completed subtask date (oldest first).
+    # Parents with no resolution date (None) are placed after those with dates.
+    results: list[ParentReadyForRt] = []
+    for key in final_parent_keys:
+        assignee = parent_to_assignee.get(key, "Unassigned")
+        last_completed = parent_to_last_completed.get(key)
+        results.append(
+            ParentReadyForRt(
+                key=key,
+                assignee=assignee,
+                last_subtask_completed=last_completed,
+            )
+        )
+
+    results.sort(key=lambda item: (item.last_subtask_completed is None, item.last_subtask_completed))
+    return results

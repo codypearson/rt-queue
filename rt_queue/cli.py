@@ -1,4 +1,8 @@
-"""Command-line entry: print parent ticket URLs ready for Review & Test."""
+"""Command-line entry: print parent tickets ready for Review & Test.
+
+Output includes the browse URL, parent assignee, and date the last subtask
+was completed (sorted oldest first by that date).
+"""
 
 from __future__ import annotations
 
@@ -7,7 +11,7 @@ import requests
 
 from rt_queue.config import Settings
 from rt_queue.jira_client import JiraClient
-from rt_queue.queue import find_parents_needing_rt
+from rt_queue.queue import ParentReadyForRt, find_parents_needing_rt
 
 EPILOG = """
 Environment variables (see .env.example):
@@ -26,7 +30,7 @@ and you were never assignee on any other subtask under that parent.
 
 
 @click.command(
-    help="Print Jira browse URLs for parent tickets ready for Review & Test.",
+    help="Print parent tickets ready for Review & Test (URL, assignee, last subtask date).",
     epilog=EPILOG,
 )
 @click.option(
@@ -39,7 +43,7 @@ and you were never assignee on any other subtask under that parent.
     ),
 )
 def main(include_worked_on: bool) -> None:
-    """Query Jira and print one parent browse URL per line on stdout."""
+    """Query Jira and print parent info (URL, assignee, last subtask date) on stdout."""
     try:
         settings = Settings.from_env()
     except ValueError as exc:
@@ -48,7 +52,7 @@ def main(include_worked_on: bool) -> None:
 
     client = JiraClient(settings)
     try:
-        parent_keys = find_parents_needing_rt(
+        parents: list[ParentReadyForRt] = find_parents_needing_rt(
             client,
             settings,
             exclude_worked_on_siblings=not include_worked_on,
@@ -60,10 +64,16 @@ def main(include_worked_on: bool) -> None:
         click.echo(str(exc), err=True)
         raise SystemExit(1) from exc
 
-    for parent_key in parent_keys:
-        click.echo(client.issue_url(parent_key))
+    for parent in parents:
+        url = client.issue_url(parent.key)
+        last_str = (
+            parent.last_subtask_completed.date().isoformat()
+            if parent.last_subtask_completed is not None
+            else "unknown"
+        )
+        click.echo(f"{url}  (Assignee: {parent.assignee}, Last subtask: {last_str})")
 
-    if not parent_keys:
+    if not parents:
         click.echo(
             "No parent tickets ready for Review & Test.",
             err=True,

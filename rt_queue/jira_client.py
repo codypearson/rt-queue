@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import datetime as dt
 from dataclasses import dataclass
 from typing import Any
 
@@ -12,8 +13,11 @@ from rt_queue.config import Settings
 
 
 @dataclass(frozen=True)
-class JiraSubtask:
-    """Minimal subtask fields used by the R&T queue."""
+class JiraIssue:
+    """Minimal issue fields used by the R&T queue.
+
+    Used for both subtasks and parent issues.
+    """
 
     key: str
     summary: str
@@ -22,6 +26,8 @@ class JiraSubtask:
     issue_type_name: str
     parent_key: str | None
     assignee_account_id: str | None
+    assignee_display_name: str | None
+    resolution_date: dt.datetime | None
 
 
 def _auth_header(email: str, api_token: str) -> str:
@@ -36,6 +42,51 @@ def escape_jql_string(value: str) -> str:
     Backslashes and double quotes are escaped per JQL string rules.
     """
     return value.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _parse_jira_datetime(value: Any) -> dt.datetime | None:
+    """Parse a Jira datetime string (e.g. resolutiondate) into a datetime.
+
+    Handles common Jira formats including 'Z' suffix and offsets without colon.
+    Returns None if parsing fails or value is empty.
+    """
+    if not value:
+        return None
+    if not isinstance(value, str):
+        return None
+    s = value.strip()
+    if not s:
+        return None
+
+    # Normalize Z to +00:00
+    if s.endswith("Z") or s.endswith("z"):
+        s = s[:-1] + "+00:00"
+
+    # Normalize offset +0000 / -0000 -> +00:00 / -00:00
+    if len(s) >= 5 and s[-5] in "+-" and s[-4:].isdigit():
+        s = s[:-2] + ":" + s[-2:]
+
+    # Strip fractional seconds if present (keep the offset)
+    # e.g. 2026-06-17T12:34:56.789+00:00 -> 2026-06-17T12:34:56+00:00
+    if "." in s:
+        try:
+            base, rest = s.split(".", 1)
+            if "+" in rest:
+                _, offset = rest.split("+", 1)
+                s = base + "+" + offset
+            elif "-" in rest:
+                _, offset = rest.split("-", 1)
+                s = base + "-" + offset
+            else:
+                s = base
+        except Exception:
+            # fall through; fromisoformat may still handle or we return None later
+            pass
+
+    try:
+        return dt.datetime.fromisoformat(s)
+    except Exception:
+        return None
 
 
 class JiraClient:
@@ -84,22 +135,29 @@ class JiraClient:
         self._myself_account_id = account_id
         return account_id
 
-    def search_jql(self, jql: str) -> list[JiraSubtask]:
+    def search_jql(self, jql: str) -> list[JiraIssue]:
         """
-        Run JQL and return all matching subtasks (paginated).
+        Run JQL and return all matching issues (paginated).
 
-        Requests summary, status, assignee, and parent fields.
+        Requests summary, status, assignee, parent, issuetype, and resolutiondate.
         """
         url = f"{self._base}/rest/api/3/search/jql"
         page_size = 50
-        out: list[JiraSubtask] = []
+        out: list[JiraIssue] = []
         next_page_token: str | None = None
 
         while True:
             body: dict[str, Any] = {
                 "jql": jql,
                 "maxResults": page_size,
-                "fields": ["summary", "status", "assignee", "parent", "issuetype"],
+                "fields": [
+                    "summary",
+                    "status",
+                    "assignee",
+                    "parent",
+                    "issuetype",
+                    "resolutiondate",
+                ],
             }
             if next_page_token:
                 body["nextPageToken"] = next_page_token
@@ -118,7 +176,7 @@ class JiraClient:
 
         return out
 
-    def _map_subtask(self, issue: dict[str, Any]) -> JiraSubtask:
+    def _map_subtask(self, issue: dict[str, Any]) -> JiraIssue:
         fields = issue.get("fields") or {}
         key = (issue.get("key") or "").strip()
         summary = (fields.get("summary") or "").strip()
@@ -133,11 +191,15 @@ class JiraClient:
             parent_key = (parent_raw.get("key") or "").strip() or None
 
         assignee_account_id: str | None = None
+        assignee_display_name: str | None = None
         assignee = fields.get("assignee")
         if isinstance(assignee, dict):
             assignee_account_id = (assignee.get("accountId") or "").strip() or None
+            assignee_display_name = (assignee.get("displayName") or "").strip() or None
 
-        return JiraSubtask(
+        resolution_date = _parse_jira_datetime(fields.get("resolutiondate"))
+
+        return JiraIssue(
             key=key,
             summary=summary,
             status_name=status_name,
@@ -145,28 +207,30 @@ class JiraClient:
             issue_type_name=issue_type_name,
             parent_key=parent_key,
             assignee_account_id=assignee_account_id,
+            assignee_display_name=assignee_display_name,
+            resolution_date=resolution_date,
         )
 
-    def is_deploy_subtask(self, subtask: JiraSubtask) -> bool:
-        """True when the subtask matches the configured Deploy issue type."""
+    def is_deploy_subtask(self, issue: JiraIssue) -> bool:
+        """True when the issue matches the configured Deploy issue type."""
         settings = self._settings
         if (
             settings.jira_deploy_issue_type_id
-            and subtask.issue_type_id == settings.jira_deploy_issue_type_id
+            and issue.issue_type_id == settings.jira_deploy_issue_type_id
         ):
             return True
         if settings.jira_deploy_issue_type_name:
             deploy_name = settings.jira_deploy_issue_type_name.lower()
-            if subtask.issue_type_name.lower() == deploy_name:
+            if issue.issue_type_name.lower() == deploy_name:
                 return True
         return False
 
 
-def summary_matches_rt(subtask: JiraSubtask, needle: str) -> bool:
-    """True when subtask summary contains ``needle`` (case-insensitive)."""
+def summary_matches_rt(issue: JiraIssue, needle: str) -> bool:
+    """True when issue summary contains ``needle`` (case-insensitive)."""
     if not needle:
         return False
-    return needle.lower() in subtask.summary.lower()
+    return needle.lower() in issue.summary.lower()
 
 
 def parent_in_project(parent_key: str | None, project_key: str) -> bool:
@@ -177,20 +241,18 @@ def parent_in_project(parent_key: str | None, project_key: str) -> bool:
     return parent_key.upper().startswith(prefix.upper())
 
 
-def status_matches(subtask: JiraSubtask, status_name: str) -> bool:
+def status_matches(issue: JiraIssue, status_name: str) -> bool:
     """True when issue status equals ``status_name`` (case-insensitive)."""
-    return subtask.status_name.strip().lower() == status_name.strip().lower()
+    return issue.status_name.strip().lower() == status_name.strip().lower()
 
 
-def is_done_status(subtask: JiraSubtask) -> bool:
+def is_done_status(issue: JiraIssue) -> bool:
     """True when the issue is in Jira status *Done* (case-insensitive)."""
-    return subtask.status_name.strip().lower() == "done"
+    return issue.status_name.strip().lower() == "done"
 
 
-def assignee_is_current_user(
-    subtask: JiraSubtask, current_account_id: str
-) -> bool:
-    """True when the subtask is assigned to the given account id."""
-    if not subtask.assignee_account_id:
+def assignee_is_current_user(issue: JiraIssue, current_account_id: str) -> bool:
+    """True when the issue is assigned to the given account id."""
+    if not issue.assignee_account_id:
         return False
-    return subtask.assignee_account_id == current_account_id
+    return issue.assignee_account_id == current_account_id
