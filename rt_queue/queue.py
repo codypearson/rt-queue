@@ -25,7 +25,7 @@ class ParentReadyForRt:
     Attributes:
         key: The Jira issue key (e.g. PROJ-123).
         assignee: Display name of the parent assignee, or "Unassigned".
-        last_subtask_completed: The most recent resolution date among the
+        last_subtask_completed: The most recent resolution date/time among the
             parent's subtasks, or None if none had a resolution date.
     """
 
@@ -111,9 +111,9 @@ def find_parents_needing_rt(
     subtasks that are now in "Done" status: completing a prior R&T subtask
     on a parent does not disqualify the parent for a subsequent R&T subtask.
 
-    Results include the parent assignee and the date the last of its subtasks
-    was completed. Results are sorted by last completed subtask date, oldest
-    first.
+    Results include the parent assignee and the date/time the last of its
+    subtasks was completed. Results are sorted by last completed subtask
+    date/time, oldest first.
     """
     current_account_id = client.get_myself_account_id()
     rt_jql = _build_rt_subtasks_jql(settings)

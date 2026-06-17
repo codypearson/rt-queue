@@ -1,7 +1,7 @@
 """Command-line entry: print parent tickets ready for Review & Test.
 
-Output includes the browse URL, parent assignee, and date the last subtask
-was completed (sorted oldest first by that date).
+Output includes the browse URL, parent assignee, and the date/time the last
+subtask was completed (sorted oldest first by that timestamp).
 """
 
 from __future__ import annotations
@@ -30,7 +30,7 @@ and you were never assignee on any other subtask under that parent.
 
 
 @click.command(
-    help="Print parent tickets ready for Review & Test (URL, assignee, last subtask date).",
+    help="Print parent tickets ready for Review & Test (URL, assignee, last subtask date/time).",
     epilog=EPILOG,
 )
 @click.option(
@@ -43,7 +43,7 @@ and you were never assignee on any other subtask under that parent.
     ),
 )
 def main(include_worked_on: bool) -> None:
-    """Query Jira and print parent info (URL, assignee, last subtask date) on stdout."""
+    """Query Jira and print parent info (URL, assignee, last subtask date/time) on stdout."""
     try:
         settings = Settings.from_env()
     except ValueError as exc:
@@ -67,7 +67,7 @@ def main(include_worked_on: bool) -> None:
     for parent in parents:
         url = client.issue_url(parent.key)
         last_str = (
-            parent.last_subtask_completed.date().isoformat()
+            parent.last_subtask_completed.isoformat()
             if parent.last_subtask_completed is not None
             else "unknown"
         )
