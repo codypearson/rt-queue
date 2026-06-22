@@ -19,7 +19,7 @@ Environment variables (see .env.example):
   Required: JIRA_BASE_URL, JIRA_EMAIL, JIRA_API_TOKEN, JIRA_PROJECT_KEY,
             and either JIRA_DEPLOY_ISSUE_TYPE_NAME or JIRA_DEPLOY_ISSUE_TYPE_ID
 
-  Optional: JIRA_RT_SUMMARY_CONTAINS (default: Review & Test),
+  Optional: JIRA_RT_SUMMARY_KEYWORDS (default: review,test),
             JIRA_RT_STATUS_NAME (default: To Do),
             JIRA_ACCOUNT_ID (default: from GET /rest/api/3/myself)
 

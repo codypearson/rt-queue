@@ -9,6 +9,24 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 
+def parse_rt_summary_keywords(raw: str) -> tuple[str, ...]:
+    """
+    Parse comma-separated R&T summary keywords from an environment value.
+
+    Empty segments are ignored. At least one non-empty keyword is required.
+    """
+    keywords = tuple(
+        segment.strip()
+        for segment in raw.split(",")
+        if segment.strip()
+    )
+    if not keywords:
+        raise ValueError(
+            "JIRA_RT_SUMMARY_KEYWORDS must include at least one non-empty keyword."
+        )
+    return keywords
+
+
 @dataclass(frozen=True)
 class Settings:
     """Runtime configuration for Jira API access and R&T queue rules."""
@@ -17,7 +35,7 @@ class Settings:
     jira_email: str
     jira_api_token: str
     jira_project_key: str
-    jira_rt_summary_contains: str
+    jira_rt_summary_keywords: tuple[str, ...]
     jira_rt_status_name: str
     jira_account_id: str | None
     jira_deploy_issue_type_name: str | None
@@ -44,14 +62,8 @@ class Settings:
                 )
             return str(value).strip()
 
-        rt_contains = os.environ.get(
-            "JIRA_RT_SUMMARY_CONTAINS", "Review & Test"
-        ).strip()
-        if not rt_contains:
-            raise ValueError(
-                "JIRA_RT_SUMMARY_CONTAINS must be non-empty "
-                '(default is "Review & Test").'
-            )
+        keywords_raw = os.environ.get("JIRA_RT_SUMMARY_KEYWORDS", "review,test")
+        rt_keywords = parse_rt_summary_keywords(keywords_raw)
 
         rt_status = os.environ.get("JIRA_RT_STATUS_NAME", "To Do").strip()
         if not rt_status:
@@ -74,7 +86,7 @@ class Settings:
             jira_email=req("JIRA_EMAIL"),
             jira_api_token=req("JIRA_API_TOKEN"),
             jira_project_key=req("JIRA_PROJECT_KEY"),
-            jira_rt_summary_contains=rt_contains,
+            jira_rt_summary_keywords=rt_keywords,
             jira_rt_status_name=rt_status,
             jira_account_id=account_id or None,
             jira_deploy_issue_type_name=deploy_name or None,

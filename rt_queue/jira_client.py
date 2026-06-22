@@ -226,11 +226,17 @@ class JiraClient:
         return False
 
 
-def summary_matches_rt(issue: JiraIssue, needle: str) -> bool:
-    """True when issue summary contains ``needle`` (case-insensitive)."""
-    if not needle:
+def summary_matches_rt(issue: JiraIssue, keywords: tuple[str, ...]) -> bool:
+    """
+    True when the issue summary contains every keyword (case-insensitive).
+
+    Each keyword is matched as a substring, so ``("review", "test")`` matches
+    summaries such as ``Review & Test`` or ``Test review pass``.
+    """
+    if not keywords:
         return False
-    return needle.lower() in issue.summary.lower()
+    summary_lower = issue.summary.lower()
+    return all(keyword.lower() in summary_lower for keyword in keywords)
 
 
 def parent_in_project(parent_key: str | None, project_key: str) -> bool:

@@ -40,12 +40,15 @@ _PARENT_BATCH_SIZE = 50
 def _build_rt_subtasks_jql(settings: Settings) -> str:
     """JQL for R&T subtasks in To Do, unassigned or assigned to current user."""
     project_key = escape_jql_string(settings.jira_project_key)
-    rt_contains = escape_jql_string(settings.jira_rt_summary_contains)
     status_name = escape_jql_string(settings.jira_rt_status_name)
+    summary_clauses = " AND ".join(
+        f'summary ~ "{escape_jql_string(keyword)}"'
+        for keyword in settings.jira_rt_summary_keywords
+    )
     return (
         f'project = "{project_key}" '
         f"AND issuetype in subTaskIssueTypes() "
-        f'AND summary ~ "{rt_contains}" '
+        f"AND {summary_clauses} "
         f'AND status = "{status_name}" '
         f"AND (assignee is EMPTY OR assignee = currentUser())"
     )
@@ -121,7 +124,7 @@ def find_parents_needing_rt(
 
     parent_to_rt_key: dict[str, str] = {}
     for subtask in rt_subtasks:
-        if not summary_matches_rt(subtask, settings.jira_rt_summary_contains):
+        if not summary_matches_rt(subtask, settings.jira_rt_summary_keywords):
             continue
         if not status_matches(subtask, settings.jira_rt_status_name):
             continue
@@ -165,7 +168,7 @@ def find_parents_needing_rt(
                 # completed (status "Done").
                 if (
                     summary_matches_rt(
-                        historical_subtask, settings.jira_rt_summary_contains
+                        historical_subtask, settings.jira_rt_summary_keywords
                     )
                     and is_done_status(historical_subtask)
                 ):
