@@ -9,7 +9,7 @@ from typing import Any
 
 import requests
 
-from rt_queue.config import Settings
+from rt_queue.config import RtKeywordGroups, Settings
 
 
 @dataclass(frozen=True)
@@ -226,17 +226,23 @@ class JiraClient:
         return False
 
 
-def summary_matches_rt(issue: JiraIssue, keywords: tuple[str, ...]) -> bool:
+def summary_matches_rt(issue: JiraIssue, keyword_groups: RtKeywordGroups) -> bool:
     """
-    True when the issue summary contains every keyword (case-insensitive).
+    True when the issue summary matches any keyword group (case-insensitive).
 
-    Each keyword is matched as a substring, so ``("review", "test")`` matches
-    summaries such as ``Review & Test`` or ``Test review pass``.
+    Within a group, every keyword must appear as a substring. Groups are OR'd,
+    so ``(("review", "test"), ("code", "review"), ("stakeholder", "review"))``
+    matches summaries such as ``Review & Test``, ``Code Review``, or
+    ``Stakeholder Review``.
     """
-    if not keywords:
+    if not keyword_groups:
         return False
     summary_lower = issue.summary.lower()
-    return all(keyword.lower() in summary_lower for keyword in keywords)
+    return any(
+        all(keyword.lower() in summary_lower for keyword in group)
+        for group in keyword_groups
+        if group
+    )
 
 
 def parent_in_project(parent_key: str | None, project_key: str) -> bool:

@@ -5,7 +5,7 @@ from __future__ import annotations
 import datetime as dt
 from dataclasses import dataclass
 
-from rt_queue.config import Settings
+from rt_queue.config import RtKeywordGroup, Settings
 from rt_queue.jira_client import (
     JiraClient,
     JiraIssue,
@@ -37,14 +37,33 @@ class ParentReadyForRt:
 _PARENT_BATCH_SIZE = 50
 
 
+def _keyword_group_to_jql(group: RtKeywordGroup) -> str:
+    """JQL for one keyword group: every keyword must appear in the summary."""
+    clauses = " AND ".join(
+        f'summary ~ "{escape_jql_string(keyword)}"' for keyword in group
+    )
+    if len(group) > 1:
+        return f"({clauses})"
+    return clauses
+
+
 def _build_rt_subtasks_jql(settings: Settings) -> str:
-    """JQL for R&T subtasks in To Do, unassigned or assigned to current user."""
+    """JQL for R&T subtasks in To Do, unassigned or assigned to current user.
+
+    Keyword groups are OR'd; keywords within a group are AND'd. A subtask
+    matches when every keyword in at least one group appears in the summary
+    (e.g. Review & Test, Code Review, or Stakeholder Review).
+    """
     project_key = escape_jql_string(settings.jira_project_key)
     status_name = escape_jql_string(settings.jira_rt_status_name)
-    summary_clauses = " AND ".join(
-        f'summary ~ "{escape_jql_string(keyword)}"'
-        for keyword in settings.jira_rt_summary_keywords
-    )
+    group_clauses = [
+        _keyword_group_to_jql(group)
+        for group in settings.jira_rt_summary_keywords
+        if group
+    ]
+    summary_clauses = " OR ".join(group_clauses)
+    if len(group_clauses) > 1:
+        summary_clauses = f"({summary_clauses})"
     return (
         f'project = "{project_key}" '
         f"AND issuetype in subTaskIssueTypes() "
