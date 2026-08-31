@@ -4,10 +4,12 @@ CLI that queries Jira Cloud and prints browse URLs for parent tickets ready for 
 
 A parent is listed when:
 
-- It has a subtask whose summary matches any configured R&T keyword group (default `review,test`, `code,review`, `stakeholder,review`; all keywords in a group must appear) in status **To Do**
+- It has a subtask whose summary matches any configured R&T keyword group (default `review,test`, `code,review`; all keywords in a group must appear) in status **To Do**
 - That R&T subtask is unassigned or assigned to you
-- Every **other** subtask under the parent is **Done**, except **Deploy** subtasks (configured issue type), which may be in any status
-- You were never assignee on any **other** subtask under the same parent (`assignee was currentUser()` in Jira history)
+- Every **other** subtask under the parent is **Done**, except **Deploy** subtasks (configured issue type, or a summary of exactly `Deploy`) and **ignored** subtasks (default `stakeholder,review`), which may be in any status
+- You were never assignee on any **other** non-ignored subtask under the same parent (`assignee was currentUser()` in Jira history)
+
+Ignored subtasks (default Stakeholder Review) are never a queue trigger, never a sibling blocker, and never disqualifying history.
 
 Output is one parent URL per line on stdout (nothing else).
 
@@ -85,7 +87,8 @@ Run `rt-queue --help` for environment variable documentation.
 | `JIRA_API_TOKEN` | yes | — |
 | `JIRA_PROJECT_KEY` | yes | — |
 | `JIRA_DEPLOY_ISSUE_TYPE_NAME` or `JIRA_DEPLOY_ISSUE_TYPE_ID` | yes (one of) | — / — |
-| `JIRA_RT_SUMMARY_KEYWORDS` | no | `review,test;code,review;stakeholder,review` |
+| `JIRA_RT_SUMMARY_KEYWORDS` | no | `review,test;code,review` |
+| `JIRA_IGNORED_SUMMARY_KEYWORDS` | no | `stakeholder,review` |
 | `JIRA_RT_STATUS_NAME` | no | `To Do` |
 | `JIRA_ACCOUNT_ID` | no | from `GET /rest/api/3/myself` |
 

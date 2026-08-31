@@ -5,7 +5,7 @@ from __future__ import annotations
 import datetime as dt
 from dataclasses import dataclass
 
-from rt_queue.config import RtKeywordGroup, Settings
+from rt_queue.config import Settings, SummaryKeywordGroup
 from rt_queue.jira_client import (
     JiraClient,
     JiraIssue,
@@ -14,7 +14,7 @@ from rt_queue.jira_client import (
     is_done_status,
     parent_in_project,
     status_matches,
-    summary_matches_rt,
+    summary_matches_keywords,
 )
 
 
@@ -37,7 +37,12 @@ class ParentReadyForRt:
 _PARENT_BATCH_SIZE = 50
 
 
-def _keyword_group_to_jql(group: RtKeywordGroup) -> str:
+def _is_ignored_subtask(subtask: JiraIssue, settings: Settings) -> bool:
+    """True when the subtask summary matches a configured ignored keyword group."""
+    return summary_matches_keywords(subtask, settings.jira_ignored_summary_keywords)
+
+
+def _keyword_group_to_jql(group: SummaryKeywordGroup) -> str:
     """JQL for one keyword group: every keyword must appear in the summary."""
     clauses = " AND ".join(
         f'summary ~ "{escape_jql_string(keyword)}"' for keyword in group
@@ -52,7 +57,7 @@ def _build_rt_subtasks_jql(settings: Settings) -> str:
 
     Keyword groups are OR'd; keywords within a group are AND'd. A subtask
     matches when every keyword in at least one group appears in the summary
-    (e.g. Review & Test, Code Review, or Stakeholder Review).
+    (e.g. Review & Test or Code Review).
     """
     project_key = escape_jql_string(settings.jira_project_key)
     status_name = escape_jql_string(settings.jira_rt_status_name)
@@ -93,20 +98,26 @@ def _build_siblings_jql(parent_keys: list[str]) -> str:
 
 def siblings_ready_for_rt(
     client: JiraClient,
+    settings: Settings,
     parent_key: str,
     rt_subtask_key: str,
     siblings: list[JiraIssue],
 ) -> bool:
     """
-    Return True when every non-Deploy sibling except the R&T subtask is Done.
+    Return True when every non-Deploy, non-ignored sibling except the R&T
+    subtask is Done.
 
-    Deploy subtasks may be in any status. The R&T subtask itself is ignored
-    (it is expected to be in To Do).
+    Deploy subtasks (by issue type or exact summary ``Deploy``) may be in any
+    status. Subtasks whose summary matches the ignored keyword groups are
+    skipped entirely. The R&T subtask itself is ignored (it is expected to
+    be in To Do).
     """
     for subtask in siblings:
         if subtask.parent_key != parent_key:
             continue
         if subtask.key == rt_subtask_key:
+            continue
+        if _is_ignored_subtask(subtask, settings):
             continue
         if client.is_deploy_subtask(subtask):
             continue
@@ -125,7 +136,10 @@ def find_parents_needing_rt(
     Return parent issues ready for Review & Test.
 
     Parents are included when they have an R&T subtask matching configured
-    summary/status/assignee rules and every other non-Deploy subtask is Done.
+    summary/status/assignee rules and every other non-Deploy, non-ignored
+    subtask is Done. Subtasks matching ``jira_ignored_summary_keywords``
+    (default Stakeholder Review) are never a queue trigger, never a
+    sibling blocker, and never disqualifying history.
 
     When ``exclude_worked_on_siblings`` is True (default), parents are excluded
     if the current user was ever assignee on any other subtask under that parent.
@@ -143,7 +157,9 @@ def find_parents_needing_rt(
 
     parent_to_rt_key: dict[str, str] = {}
     for subtask in rt_subtasks:
-        if not summary_matches_rt(subtask, settings.jira_rt_summary_keywords):
+        if _is_ignored_subtask(subtask, settings):
+            continue
+        if not summary_matches_keywords(subtask, settings.jira_rt_summary_keywords):
             continue
         if not status_matches(subtask, settings.jira_rt_status_name):
             continue
@@ -178,6 +194,8 @@ def find_parents_needing_rt(
                 rt_subtask_key = parent_to_rt_key[parent_key]
                 if historical_subtask.key == rt_subtask_key:
                     continue
+                if _is_ignored_subtask(historical_subtask, settings):
+                    continue
 
                 # Relaxed worked-on-siblings rule:
                 # Ignore historical assignments to *completed* Review & Test subtasks.
@@ -186,7 +204,7 @@ def find_parents_needing_rt(
                 # subtask on a parent when prior R&T work on the same parent has been
                 # completed (status "Done").
                 if (
-                    summary_matches_rt(
+                    summary_matches_keywords(
                         historical_subtask, settings.jira_rt_summary_keywords
                     )
                     and is_done_status(historical_subtask)
@@ -208,7 +226,7 @@ def find_parents_needing_rt(
                 continue
             rt_key = parent_to_rt_key[parent_key]
             if not siblings_ready_for_rt(
-                client, parent_key, rt_key, all_siblings
+                client, settings, parent_key, rt_key, all_siblings
             ):
                 excluded_parents.add(parent_key)
                 continue

@@ -11,27 +11,31 @@ from dotenv import load_dotenv
 # Default R&T summary keyword groups. Groups are separated by ``;``; keywords
 # within a group are comma-separated. A subtask matches when every keyword in
 # at least one group appears in the summary (case-insensitive substring).
-DEFAULT_RT_SUMMARY_KEYWORDS = "review,test;code,review;stakeholder,review"
+DEFAULT_RT_SUMMARY_KEYWORDS = "review,test;code,review"
+
+# Default ignored summary keyword groups. Matching subtasks are never a
+# queue trigger, never a sibling blocker, and never disqualifying history.
+DEFAULT_IGNORED_SUMMARY_KEYWORDS = "stakeholder,review"
 
 # One AND-group of keywords, e.g. ("review", "test").
-RtKeywordGroup = tuple[str, ...]
+SummaryKeywordGroup = tuple[str, ...]
 # OR of AND-groups, e.g. (("review", "test"), ("code", "review")).
-RtKeywordGroups = tuple[RtKeywordGroup, ...]
+SummaryKeywordGroups = tuple[SummaryKeywordGroup, ...]
 
 
-def parse_rt_summary_keywords(raw: str) -> RtKeywordGroups:
+def parse_summary_keyword_groups(raw: str) -> SummaryKeywordGroups:
     """
-    Parse R&T summary keyword groups from an environment value.
+    Parse summary keyword groups from an environment value.
 
     Groups are separated by ``;``. Keywords within a group are comma-separated.
-    Empty segments are ignored. At least one group with at least one keyword
-    is required.
+    Empty segments are ignored. An empty result (no groups) is valid and
+    means the list is unused.
 
     A subtask matches when every keyword in at least one group appears in the
     summary, so ``review,test;code,review`` matches both ``Review & Test`` and
     ``Code Review``.
     """
-    groups: list[RtKeywordGroup] = []
+    groups: list[SummaryKeywordGroup] = []
     for group_raw in raw.split(";"):
         keywords = tuple(
             segment.strip()
@@ -40,11 +44,6 @@ def parse_rt_summary_keywords(raw: str) -> RtKeywordGroups:
         )
         if keywords:
             groups.append(keywords)
-    if not groups:
-        raise ValueError(
-            "JIRA_RT_SUMMARY_KEYWORDS must include at least one non-empty "
-            "keyword group."
-        )
     return tuple(groups)
 
 
@@ -54,13 +53,18 @@ class Settings:
 
     ``jira_rt_summary_keywords`` is an OR of AND-groups: a subtask matches
     when every keyword in at least one group appears in its summary.
+
+    ``jira_ignored_summary_keywords`` uses the same group format. Matching
+    subtasks are skipped entirely (not a trigger, not a blocker, no
+    worked-on history).
     """
 
     jira_base_url: str
     jira_email: str
     jira_api_token: str
     jira_project_key: str
-    jira_rt_summary_keywords: RtKeywordGroups
+    jira_rt_summary_keywords: SummaryKeywordGroups
+    jira_ignored_summary_keywords: SummaryKeywordGroups
     jira_rt_status_name: str
     jira_account_id: str | None
     jira_deploy_issue_type_name: str | None
@@ -90,7 +94,17 @@ class Settings:
         keywords_raw = os.environ.get(
             "JIRA_RT_SUMMARY_KEYWORDS", DEFAULT_RT_SUMMARY_KEYWORDS
         )
-        rt_keywords = parse_rt_summary_keywords(keywords_raw)
+        rt_keywords = parse_summary_keyword_groups(keywords_raw)
+        if not rt_keywords:
+            raise ValueError(
+                "JIRA_RT_SUMMARY_KEYWORDS must include at least one non-empty "
+                "keyword group."
+            )
+
+        ignored_raw = os.environ.get(
+            "JIRA_IGNORED_SUMMARY_KEYWORDS", DEFAULT_IGNORED_SUMMARY_KEYWORDS
+        )
+        ignored_keywords = parse_summary_keyword_groups(ignored_raw)
 
         rt_status = os.environ.get("JIRA_RT_STATUS_NAME", "To Do").strip()
         if not rt_status:
@@ -114,6 +128,7 @@ class Settings:
             jira_api_token=req("JIRA_API_TOKEN"),
             jira_project_key=req("JIRA_PROJECT_KEY"),
             jira_rt_summary_keywords=rt_keywords,
+            jira_ignored_summary_keywords=ignored_keywords,
             jira_rt_status_name=rt_status,
             jira_account_id=account_id or None,
             jira_deploy_issue_type_name=deploy_name or None,

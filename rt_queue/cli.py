@@ -9,7 +9,11 @@ from __future__ import annotations
 import click
 import requests
 
-from rt_queue.config import DEFAULT_RT_SUMMARY_KEYWORDS, Settings
+from rt_queue.config import (
+    DEFAULT_IGNORED_SUMMARY_KEYWORDS,
+    DEFAULT_RT_SUMMARY_KEYWORDS,
+    Settings,
+)
 from rt_queue.jira_client import JiraClient
 from rt_queue.queue import ParentReadyForRt, find_parents_needing_rt
 
@@ -20,12 +24,14 @@ Environment variables (see .env.example):
             and either JIRA_DEPLOY_ISSUE_TYPE_NAME or JIRA_DEPLOY_ISSUE_TYPE_ID
 
   Optional: JIRA_RT_SUMMARY_KEYWORDS (default: {DEFAULT_RT_SUMMARY_KEYWORDS}),
+            JIRA_IGNORED_SUMMARY_KEYWORDS (default: {DEFAULT_IGNORED_SUMMARY_KEYWORDS}),
             JIRA_RT_STATUS_NAME (default: To Do),
             JIRA_ACCOUNT_ID (default: from GET /rest/api/3/myself)
 
 A parent is listed when it has an R&T subtask in the configured status,
-unassigned or assigned to you, every other non-Deploy subtask is Done,
-and you were never assignee on any other subtask under that parent.
+unassigned or assigned to you, every other non-Deploy, non-ignored subtask
+is Done, and you were never assignee on any other non-ignored subtask under
+that parent. Deploy is matched by issue type or an exact summary of Deploy.
 """
 
 

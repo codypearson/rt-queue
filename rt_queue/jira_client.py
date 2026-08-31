@@ -9,7 +9,11 @@ from typing import Any
 
 import requests
 
-from rt_queue.config import RtKeywordGroups, Settings
+from rt_queue.config import Settings, SummaryKeywordGroups
+
+# Exact summary (case/whitespace-insensitive) treated as a Deploy sibling
+# when the issue was created as a Sub-task instead of the Deploy type.
+DEPLOY_SUMMARY = "deploy"
 
 
 @dataclass(frozen=True)
@@ -212,7 +216,13 @@ class JiraClient:
         )
 
     def is_deploy_subtask(self, issue: JiraIssue) -> bool:
-        """True when the issue matches the configured Deploy issue type."""
+        """True when the issue is a Deploy sibling.
+
+        Matches the configured Deploy issue type (name or id), or a summary
+        that is exactly ``Deploy`` (case/whitespace-insensitive). The summary
+        fallback covers Deploys created as a Sub-task instead of the
+        Deploy type.
+        """
         settings = self._settings
         if (
             settings.jira_deploy_issue_type_id
@@ -223,17 +233,20 @@ class JiraClient:
             deploy_name = settings.jira_deploy_issue_type_name.lower()
             if issue.issue_type_name.lower() == deploy_name:
                 return True
+        if issue.summary.strip().lower() == DEPLOY_SUMMARY:
+            return True
         return False
 
 
-def summary_matches_rt(issue: JiraIssue, keyword_groups: RtKeywordGroups) -> bool:
+def summary_matches_keywords(
+    issue: JiraIssue, keyword_groups: SummaryKeywordGroups
+) -> bool:
     """
     True when the issue summary matches any keyword group (case-insensitive).
 
     Within a group, every keyword must appear as a substring. Groups are OR'd,
-    so ``(("review", "test"), ("code", "review"), ("stakeholder", "review"))``
-    matches summaries such as ``Review & Test``, ``Code Review``, or
-    ``Stakeholder Review``.
+    so ``(("review", "test"), ("code", "review"))`` matches summaries such as
+    ``Review & Test`` or ``Code Review``.
     """
     if not keyword_groups:
         return False
