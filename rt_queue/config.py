@@ -17,6 +17,12 @@ DEFAULT_RT_SUMMARY_KEYWORDS = "review,test;code,review"
 # queue trigger, never a sibling blocker, and never disqualifying history.
 DEFAULT_IGNORED_SUMMARY_KEYWORDS = "stakeholder,review"
 
+# Default parent status when a PR-linked ticket is ready for the queue.
+DEFAULT_JIRA_PARENT_STATUS_NAME = "Pending Review"
+
+# Default R&T subtask statuses (comma-separated in ``JIRA_RT_STATUS_NAME``).
+DEFAULT_JIRA_RT_STATUS_NAMES = "To Do,Qualified"
+
 # One AND-group of keywords, e.g. ("review", "test").
 SummaryKeywordGroup = tuple[str, ...]
 # OR of AND-groups, e.g. (("review", "test"), ("code", "review")).
@@ -47,9 +53,47 @@ def parse_summary_keyword_groups(raw: str) -> SummaryKeywordGroups:
     return tuple(groups)
 
 
+def parse_status_names(raw: str) -> tuple[str, ...]:
+    """
+    Parse comma-separated Jira status names.
+
+    Empty segments are ignored. Raises when the result would be empty.
+    """
+    names = tuple(segment.strip() for segment in raw.split(",") if segment.strip())
+    if not names:
+        raise ValueError("JIRA_RT_STATUS_NAME must include at least one status name.")
+    return names
+
+
+def parse_github_repositories(raw: str) -> tuple[str, ...]:
+    """
+    Parse a comma-separated list of ``owner/repo`` GitHub repository slugs.
+
+    Whitespace around entries is stripped. Empty segments are ignored.
+    """
+    repos: list[str] = []
+    for segment in raw.split(","):
+        slug = segment.strip()
+        if not slug:
+            continue
+        if "/" not in slug:
+            raise ValueError(
+                f"Invalid GITHUB_REPOSITORIES entry '{slug}': "
+                "expected owner/repo format."
+            )
+        repos.append(slug)
+    if not repos:
+        raise ValueError(
+            "GITHUB_REPOSITORIES must include at least one owner/repo entry."
+        )
+    return tuple(repos)
+
+
 @dataclass(frozen=True)
 class Settings:
-    """Runtime configuration for Jira API access and R&T queue rules.
+    """Runtime configuration for GitHub, Jira API access, and R&T queue rules.
+
+    ``github_repositories`` lists ``owner/repo`` slugs to scan for open PRs.
 
     ``jira_rt_summary_keywords`` is an OR of AND-groups: a subtask matches
     when every keyword in at least one group appears in its summary.
@@ -57,15 +101,21 @@ class Settings:
     ``jira_ignored_summary_keywords`` uses the same group format. Matching
     subtasks are skipped entirely (not a trigger, not a blocker, no
     worked-on history).
+
+    ``jira_parent_status_name`` is the required status on the parent issue
+    linked to each qualifying pull request (default Pending Review).
     """
 
+    github_token: str
+    github_repositories: tuple[str, ...]
+    github_login: str | None
     jira_base_url: str
     jira_email: str
     jira_api_token: str
-    jira_project_key: str
+    jira_parent_status_name: str
     jira_rt_summary_keywords: SummaryKeywordGroups
     jira_ignored_summary_keywords: SummaryKeywordGroups
-    jira_rt_status_name: str
+    jira_rt_status_names: tuple[str, ...]
     jira_account_id: str | None
     jira_deploy_issue_type_name: str | None
     jira_deploy_issue_type_id: str | None
@@ -91,6 +141,11 @@ class Settings:
                 )
             return str(value).strip()
 
+        github_repos_raw = req("GITHUB_REPOSITORIES")
+        github_repositories = parse_github_repositories(github_repos_raw)
+
+        github_login = os.environ.get("GITHUB_LOGIN", "").strip() or None
+
         keywords_raw = os.environ.get(
             "JIRA_RT_SUMMARY_KEYWORDS", DEFAULT_RT_SUMMARY_KEYWORDS
         )
@@ -106,11 +161,19 @@ class Settings:
         )
         ignored_keywords = parse_summary_keyword_groups(ignored_raw)
 
-        rt_status = os.environ.get("JIRA_RT_STATUS_NAME", "To Do").strip()
-        if not rt_status:
+        parent_status = os.environ.get(
+            "JIRA_PARENT_STATUS_NAME", DEFAULT_JIRA_PARENT_STATUS_NAME
+        ).strip()
+        if not parent_status:
             raise ValueError(
-                'JIRA_RT_STATUS_NAME must be non-empty (default is "To Do").'
+                'JIRA_PARENT_STATUS_NAME must be non-empty '
+                f'(default is "{DEFAULT_JIRA_PARENT_STATUS_NAME}").'
             )
+
+        rt_status_raw = os.environ.get(
+            "JIRA_RT_STATUS_NAME", DEFAULT_JIRA_RT_STATUS_NAMES
+        ).strip()
+        jira_rt_status_names = parse_status_names(rt_status_raw)
 
         account_id = os.environ.get("JIRA_ACCOUNT_ID", "").strip()
 
@@ -123,13 +186,16 @@ class Settings:
             )
 
         return Settings(
+            github_token=req("GITHUB_TOKEN"),
+            github_repositories=github_repositories,
+            github_login=github_login,
             jira_base_url=req("JIRA_BASE_URL").rstrip("/"),
             jira_email=req("JIRA_EMAIL"),
             jira_api_token=req("JIRA_API_TOKEN"),
-            jira_project_key=req("JIRA_PROJECT_KEY"),
+            jira_parent_status_name=parent_status,
             jira_rt_summary_keywords=rt_keywords,
             jira_ignored_summary_keywords=ignored_keywords,
-            jira_rt_status_name=rt_status,
+            jira_rt_status_names=jira_rt_status_names,
             jira_account_id=account_id or None,
             jira_deploy_issue_type_name=deploy_name or None,
             jira_deploy_issue_type_id=deploy_id or None,

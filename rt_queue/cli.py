@@ -1,7 +1,7 @@
 """Command-line entry: print parent tickets ready for Review & Test.
 
-Output includes the browse URL, parent assignee, and the date/time the last
-subtask was completed (sorted oldest first by that timestamp).
+Output includes the browse URL, parent assignee, and GitHub pull request URL
+(sorted oldest PR first, then oldest Jira parent update).
 """
 
 from __future__ import annotations
@@ -11,32 +11,43 @@ import requests
 
 from rt_queue.config import (
     DEFAULT_IGNORED_SUMMARY_KEYWORDS,
+    DEFAULT_JIRA_PARENT_STATUS_NAME,
+    DEFAULT_JIRA_RT_STATUS_NAMES,
     DEFAULT_RT_SUMMARY_KEYWORDS,
     Settings,
 )
+from rt_queue.github_client import GitHubClient
 from rt_queue.jira_client import JiraClient
-from rt_queue.queue import ParentReadyForRt, find_parents_needing_rt
+from rt_queue.queue import find_parents_needing_rt
 
 EPILOG = f"""
 Environment variables (see .env.example):
 
-  Required: JIRA_BASE_URL, JIRA_EMAIL, JIRA_API_TOKEN, JIRA_PROJECT_KEY,
+  Required: GITHUB_TOKEN, GITHUB_REPOSITORIES (comma-separated owner/repo),
+            JIRA_BASE_URL, JIRA_EMAIL, JIRA_API_TOKEN,
             and either JIRA_DEPLOY_ISSUE_TYPE_NAME or JIRA_DEPLOY_ISSUE_TYPE_ID
 
-  Optional: JIRA_RT_SUMMARY_KEYWORDS (default: {DEFAULT_RT_SUMMARY_KEYWORDS}),
+  Optional: GITHUB_LOGIN (default: from GET /user),
+            JIRA_PARENT_STATUS_NAME (default: {DEFAULT_JIRA_PARENT_STATUS_NAME}),
+            JIRA_RT_SUMMARY_KEYWORDS (default: {DEFAULT_RT_SUMMARY_KEYWORDS}),
             JIRA_IGNORED_SUMMARY_KEYWORDS (default: {DEFAULT_IGNORED_SUMMARY_KEYWORDS}),
-            JIRA_RT_STATUS_NAME (default: To Do),
+            JIRA_RT_STATUS_NAME (default: {DEFAULT_JIRA_RT_STATUS_NAMES}),
             JIRA_ACCOUNT_ID (default: from GET /rest/api/3/myself)
 
-A parent is listed when it has an R&T subtask in the configured status,
-unassigned or assigned to you, every other non-Deploy, non-ignored subtask
-is Done, and you were never assignee on any other non-ignored subtask under
-that parent. Deploy is matched by issue type or an exact summary of Deploy.
+The tool lists open, non-draft GitHub PRs (not authored by you) in the
+configured repos, resolves each to a Jira parent (dev panel link or title key),
+requires parent status {DEFAULT_JIRA_PARENT_STATUS_NAME}, then applies R&T
+subtask rules: an R&T subtask in the configured status unassigned or assigned
+to you, every other non-Deploy non-ignored subtask Done, and optional
+worked-on-sibling exclusion.
 """
 
 
 @click.command(
-    help="Print parent tickets ready for Review & Test (URL, assignee, last subtask date/time).",
+    help=(
+        "Print parent tickets ready for Review & Test "
+        "(URL, assignee, PR URL)."
+    ),
     epilog=EPILOG,
 )
 @click.option(
@@ -49,35 +60,43 @@ that parent. Deploy is matched by issue type or an exact summary of Deploy.
     ),
 )
 def main(include_worked_on: bool) -> None:
-    """Query Jira and print parent info (URL, assignee, last subtask date/time) on stdout."""
+    """Query GitHub and Jira; print queue entries on stdout."""
     try:
         settings = Settings.from_env()
     except ValueError as exc:
         click.echo(str(exc), err=True)
         raise SystemExit(1) from exc
 
-    client = JiraClient(settings)
+    jira_client = JiraClient(settings)
+    github_client = GitHubClient(settings)
     try:
-        parents: list[ParentReadyForRt] = find_parents_needing_rt(
-            client,
+        build_result = find_parents_needing_rt(
+            jira_client,
+            github_client,
             settings,
             exclude_worked_on_siblings=not include_worked_on,
         )
     except requests.HTTPError as exc:
-        click.echo(f"Jira API error: {exc}", err=True)
+        click.echo(f"API error: {exc}", err=True)
         raise SystemExit(1) from exc
     except ValueError as exc:
         click.echo(str(exc), err=True)
         raise SystemExit(1) from exc
 
-    for parent in parents:
-        url = client.issue_url(parent.key)
-        last_str = (
-            parent.last_subtask_completed.isoformat()
-            if parent.last_subtask_completed is not None
-            else "unknown"
+    parents = build_result.entries
+
+    if build_result.skipped_unresolved_pr_count > 0:
+        click.echo(
+            f"Skipped {build_result.skipped_unresolved_pr_count} pull request(s) "
+            "with no resolvable Jira parent.",
+            err=True,
         )
-        click.echo(f"{url}  (Assignee: {parent.assignee}, Last subtask: {last_str})")
+
+    for parent in parents:
+        url = jira_client.issue_url(parent.key)
+        click.echo(
+            f"{url}  (Assignee: {parent.assignee}, PR: {parent.pull_request_url})"
+        )
 
     if not parents:
         click.echo(

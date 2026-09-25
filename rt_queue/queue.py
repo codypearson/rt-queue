@@ -1,37 +1,42 @@
-"""Find parent Jira issues ready for Review & Test."""
+"""Find parent Jira issues ready for Review & Test from GitHub pull requests."""
 
 from __future__ import annotations
 
 import datetime as dt
 from dataclasses import dataclass
 
-from rt_queue.config import Settings, SummaryKeywordGroup
+from rt_queue.config import Settings
+from rt_queue.github_client import GitHubClient, GitHubPullRequest
 from rt_queue.jira_client import (
     JiraClient,
     JiraIssue,
     assignee_is_current_user,
-    escape_jql_string,
+    format_jql_issue_keys,
     is_done_status,
-    parent_in_project,
     status_matches,
+    status_matches_any,
     summary_matches_keywords,
 )
 
 
 @dataclass(frozen=True)
 class ParentReadyForRt:
-    """A parent issue that is ready for Review & Test.
+    """A parent issue that is ready for Review & Test, tied to one pull request.
 
     Attributes:
         key: The Jira issue key (e.g. PROJ-123).
         assignee: Display name of the parent assignee, or "Unassigned".
-        last_subtask_completed: The most recent resolution date/time among the
-            parent's subtasks, or None if none had a resolution date.
+        pull_request_url: GitHub pull request URL that sourced this queue entry.
+        pull_request_created_at: When the pull request was opened on GitHub.
+        parent_updated_at: When the parent issue was last updated in Jira, if known.
     """
 
     key: str
     assignee: str
-    last_subtask_completed: dt.datetime | None
+    pull_request_url: str
+    pull_request_created_at: dt.datetime
+    parent_updated_at: dt.datetime | None
+
 
 # Batch size for ``parent in (...)`` JQL queries.
 _PARENT_BATCH_SIZE = 50
@@ -42,58 +47,51 @@ def _is_ignored_subtask(subtask: JiraIssue, settings: Settings) -> bool:
     return summary_matches_keywords(subtask, settings.jira_ignored_summary_keywords)
 
 
-def _keyword_group_to_jql(group: SummaryKeywordGroup) -> str:
-    """JQL for one keyword group: every keyword must appear in the summary."""
-    clauses = " AND ".join(
-        f'summary ~ "{escape_jql_string(keyword)}"' for keyword in group
-    )
-    if len(group) > 1:
-        return f"({clauses})"
-    return clauses
-
-
-def _build_rt_subtasks_jql(settings: Settings) -> str:
-    """JQL for R&T subtasks in To Do, unassigned or assigned to current user.
-
-    Keyword groups are OR'd; keywords within a group are AND'd. A subtask
-    matches when every keyword in at least one group appears in the summary
-    (e.g. Review & Test or Code Review).
-    """
-    project_key = escape_jql_string(settings.jira_project_key)
-    status_name = escape_jql_string(settings.jira_rt_status_name)
-    group_clauses = [
-        _keyword_group_to_jql(group)
-        for group in settings.jira_rt_summary_keywords
-        if group
-    ]
-    summary_clauses = " OR ".join(group_clauses)
-    if len(group_clauses) > 1:
-        summary_clauses = f"({summary_clauses})"
-    return (
-        f'project = "{project_key}" '
-        f"AND issuetype in subTaskIssueTypes() "
-        f"AND {summary_clauses} "
-        f'AND status = "{status_name}" '
-        f"AND (assignee is EMPTY OR assignee = currentUser())"
-    )
+def _child_belongs_to_parent(subtask: JiraIssue, parent_key: str) -> bool:
+    """True when ``subtask`` is a direct child of ``parent_key`` (case-insensitive)."""
+    if not subtask.parent_key:
+        return False
+    return subtask.parent_key.upper() == parent_key.upper()
 
 
 def _build_sibling_work_jql(parent_keys: list[str]) -> str:
-    """JQL for subtasks under parents where assignee was ever currentUser()."""
-    keys_csv = ", ".join(parent_keys)
-    return (
-        f"parent in ({keys_csv}) "
-        f"AND issuetype in subTaskIssueTypes() "
-        f"AND assignee was currentUser()"
-    )
+    """JQL for child issues under parents where assignee was ever currentUser()."""
+    keys_csv = format_jql_issue_keys(parent_keys)
+    return f"parent in ({keys_csv}) AND assignee was currentUser()"
 
 
 def _build_siblings_jql(parent_keys: list[str]) -> str:
-    """JQL for all subtasks under the given parent keys."""
-    keys_csv = ", ".join(parent_keys)
-    return (
-        f"parent in ({keys_csv}) AND issuetype in subTaskIssueTypes()"
-    )
+    """JQL for all direct child issues under the given parent keys."""
+    keys_csv = format_jql_issue_keys(parent_keys)
+    return f"parent in ({keys_csv})"
+
+
+def _select_rt_subtask_for_parent(
+    parent_key: str,
+    siblings: list[JiraIssue],
+    settings: Settings,
+    current_account_id: str,
+) -> str | None:
+    """
+    Return the R&T subtask key for ``parent_key`` when one qualifies, else None.
+
+    The subtask must match configured summary keywords, R&T status, and be
+    unassigned or assigned to the current user. Ignored summaries never qualify.
+    """
+    for subtask in siblings:
+        if not _child_belongs_to_parent(subtask, parent_key):
+            continue
+        if _is_ignored_subtask(subtask, settings):
+            continue
+        if not summary_matches_keywords(subtask, settings.jira_rt_summary_keywords):
+            continue
+        if not status_matches_any(subtask, settings.jira_rt_status_names):
+            continue
+        if subtask.assignee_account_id is not None:
+            if not assignee_is_current_user(subtask, current_account_id):
+                continue
+        return subtask.key
+    return None
 
 
 def siblings_ready_for_rt(
@@ -113,7 +111,7 @@ def siblings_ready_for_rt(
     be in To Do).
     """
     for subtask in siblings:
-        if subtask.parent_key != parent_key:
+        if not _child_belongs_to_parent(subtask, parent_key):
             continue
         if subtask.key == rt_subtask_key:
             continue
@@ -126,153 +124,192 @@ def siblings_ready_for_rt(
     return True
 
 
-def find_parents_needing_rt(
+def _parent_excluded_for_worked_on_siblings(
     client: JiraClient,
+    settings: Settings,
+    parent_key: str,
+    rt_subtask_key: str,
+    worked_subtasks: list[JiraIssue],
+) -> bool:
+    """
+    Return True when the parent should be excluded due to worked-on sibling history.
+
+    Matches the relaxed rule: completed prior R&T subtasks do not disqualify.
+    """
+    for historical_subtask in worked_subtasks:
+        if not _child_belongs_to_parent(historical_subtask, parent_key):
+            continue
+        if historical_subtask.key == rt_subtask_key:
+            continue
+        if _is_ignored_subtask(historical_subtask, settings):
+            continue
+        if (
+            summary_matches_keywords(
+                historical_subtask, settings.jira_rt_summary_keywords
+            )
+            and is_done_status(historical_subtask)
+        ):
+            continue
+        return True
+    return False
+
+
+# Sort parents with unknown Jira ``updated`` after those with a known timestamp.
+_SORT_UNKNOWN_JIRA_UPDATED = dt.datetime.max.replace(tzinfo=dt.timezone.utc)
+
+
+@dataclass(frozen=True)
+class QueueBuildResult:
+    """Result of building the R&T queue from pull requests."""
+
+    entries: list[ParentReadyForRt]
+    skipped_unresolved_pr_count: int
+
+
+def find_parents_needing_rt(
+    jira_client: JiraClient,
+    github_client: GitHubClient,
     settings: Settings,
     *,
     exclude_worked_on_siblings: bool = True,
-) -> list[ParentReadyForRt]:
+) -> QueueBuildResult:
     """
-    Return parent issues ready for Review & Test.
+    Return parent issues ready for Review & Test, one entry per qualifying PR.
 
-    Parents are included when they have an R&T subtask matching configured
-    summary/status/assignee rules and every other non-Deploy, non-ignored
-    subtask is Done. Subtasks matching ``jira_ignored_summary_keywords``
-    (default Stakeholder Review) are never a queue trigger, never a
-    sibling blocker, and never disqualifying history.
+    Open, non-draft pull requests in configured GitHub repos (not authored by
+    you) are resolved to a parent Jira issue. Parents must be in
+    ``jira_parent_status_name`` (default Pending Review) and satisfy the
+    existing subtask rules: an R&T subtask in the configured status assigned
+    to you or unassigned, all other non-Deploy siblings Done, and optional
+    worked-on-sibling exclusion.
 
-    When ``exclude_worked_on_siblings`` is True (default), parents are excluded
-    if the current user was ever assignee on any other subtask under that parent.
-    This exclusion is relaxed for historical assignments to Review & Test
-    subtasks that are now in "Done" status: completing a prior R&T subtask
-    on a parent does not disqualify the parent for a subsequent R&T subtask.
-
-    Results include the parent assignee and the date/time the last of its
-    subtasks was completed. Results are sorted by last completed subtask
-    date/time, oldest first.
+    Results are sorted by pull request creation time (oldest first), then parent
+    issue updated time (oldest first).
     """
-    current_account_id = client.get_myself_account_id()
-    rt_jql = _build_rt_subtasks_jql(settings)
-    rt_subtasks = client.search_jql(rt_jql)
+    current_account_id = jira_client.get_myself_account_id()
+    pull_requests = github_client.list_open_pull_requests_not_by_me()
 
-    parent_to_rt_key: dict[str, str] = {}
-    for subtask in rt_subtasks:
-        if _is_ignored_subtask(subtask, settings):
-            continue
-        if not summary_matches_keywords(subtask, settings.jira_rt_summary_keywords):
-            continue
-        if not status_matches(subtask, settings.jira_rt_status_name):
-            continue
-        if not parent_in_project(subtask.parent_key, settings.jira_project_key):
-            continue
-        if subtask.assignee_account_id is not None:
-            if not assignee_is_current_user(subtask, current_account_id):
-                continue
+    resolved_pairs: list[tuple[str, GitHubPullRequest]] = []
+    skipped_unresolved = 0
 
-        parent_key = subtask.parent_key
+    for pull_request in pull_requests:
+        commit_messages = github_client.list_pull_request_commits(
+            pull_request.repository_full_name, pull_request.number
+        )
+        parent_key = jira_client.resolve_parent_for_pull_request(
+            pull_request, commit_messages
+        )
         if not parent_key:
+            skipped_unresolved += 1
             continue
-        if parent_key not in parent_to_rt_key:
-            parent_to_rt_key[parent_key] = subtask.key
+        resolved_pairs.append((parent_key, pull_request))
 
-    if not parent_to_rt_key:
-        return []
+    if not resolved_pairs:
+        return QueueBuildResult(entries=[], skipped_unresolved_pr_count=skipped_unresolved)
+
+    unique_parent_keys = list(dict.fromkeys(key for key, _ in resolved_pairs))
+
+    parent_issues_by_key: dict[str, JiraIssue] = {}
+    for batch_start in range(0, len(unique_parent_keys), _PARENT_BATCH_SIZE):
+        batch = unique_parent_keys[batch_start : batch_start + _PARENT_BATCH_SIZE]
+        keys_csv = format_jql_issue_keys(batch)
+        for parent_issue in jira_client.search_jql(f"key in ({keys_csv})"):
+            if parent_issue.key in batch:
+                parent_issues_by_key[parent_issue.key] = parent_issue
+
+    qualifying_parent_keys: set[str] = set()
+    parent_to_assignee: dict[str, str] = {}
+    parent_to_updated_at: dict[str, dt.datetime | None] = {}
+    parent_to_rt_key: dict[str, str] = {}
+
+    status_filtered_keys: list[str] = []
+    for parent_key in unique_parent_keys:
+        parent_issue = parent_issues_by_key.get(parent_key)
+        if parent_issue is None:
+            continue
+        if not status_matches(parent_issue, settings.jira_parent_status_name):
+            continue
+        status_filtered_keys.append(parent_key)
+        display_name = parent_issue.assignee_display_name or "Unassigned"
+        parent_to_assignee[parent_key] = display_name
+        parent_to_updated_at[parent_key] = parent_issue.updated_at
+
+    if not status_filtered_keys:
+        return QueueBuildResult(
+            entries=[], skipped_unresolved_pr_count=skipped_unresolved
+        )
 
     excluded_parents: set[str] = set()
-    parent_keys = list(parent_to_rt_key.keys())
 
-    if exclude_worked_on_siblings:
-        for batch_start in range(0, len(parent_keys), _PARENT_BATCH_SIZE):
-            batch = parent_keys[batch_start : batch_start + _PARENT_BATCH_SIZE]
-            sibling_jql = _build_sibling_work_jql(batch)
-            worked_subtasks = client.search_jql(sibling_jql)
-
-            for historical_subtask in worked_subtasks:
-                parent_key = historical_subtask.parent_key
-                if not parent_key or parent_key not in parent_to_rt_key:
-                    continue
-                rt_subtask_key = parent_to_rt_key[parent_key]
-                if historical_subtask.key == rt_subtask_key:
-                    continue
-                if _is_ignored_subtask(historical_subtask, settings):
-                    continue
-
-                # Relaxed worked-on-siblings rule:
-                # Ignore historical assignments to *completed* Review & Test subtasks.
-                # Previously, any assignment (via "assignee was currentUser()") on a
-                # sibling subtask would exclude the parent. Now we allow a fresh R&T
-                # subtask on a parent when prior R&T work on the same parent has been
-                # completed (status "Done").
-                if (
-                    summary_matches_keywords(
-                        historical_subtask, settings.jira_rt_summary_keywords
-                    )
-                    and is_done_status(historical_subtask)
-                ):
-                    continue
-
-                excluded_parents.add(parent_key)
-
-    # Map from parent key to the most recent resolution date among its subtasks.
-    parent_to_last_completed: dict[str, dt.datetime | None] = {}
-
-    for batch_start in range(0, len(parent_keys), _PARENT_BATCH_SIZE):
-        batch = parent_keys[batch_start : batch_start + _PARENT_BATCH_SIZE]
+    for batch_start in range(0, len(status_filtered_keys), _PARENT_BATCH_SIZE):
+        batch = status_filtered_keys[batch_start : batch_start + _PARENT_BATCH_SIZE]
         siblings_jql = _build_siblings_jql(batch)
-        all_siblings = client.search_jql(siblings_jql)
+        all_siblings = jira_client.search_jql(siblings_jql)
 
         for parent_key in batch:
-            if parent_key in excluded_parents:
+            rt_key = _select_rt_subtask_for_parent(
+                parent_key,
+                all_siblings,
+                settings,
+                current_account_id,
+            )
+            if rt_key is None:
+                excluded_parents.add(parent_key)
                 continue
-            rt_key = parent_to_rt_key[parent_key]
+            parent_to_rt_key[parent_key] = rt_key
             if not siblings_ready_for_rt(
-                client, settings, parent_key, rt_key, all_siblings
+                jira_client, settings, parent_key, rt_key, all_siblings
             ):
                 excluded_parents.add(parent_key)
                 continue
 
-            # Determine the latest completion date across all siblings for this parent.
-            max_completed: dt.datetime | None = None
-            for sibling in all_siblings:
-                if sibling.parent_key != parent_key:
-                    continue
-                if sibling.resolution_date is None:
-                    continue
-                if max_completed is None or sibling.resolution_date > max_completed:
-                    max_completed = sibling.resolution_date
-            parent_to_last_completed[parent_key] = max_completed
+    if exclude_worked_on_siblings:
+        eligible_keys = [
+            key
+            for key in status_filtered_keys
+            if key not in excluded_parents and key in parent_to_rt_key
+        ]
+        for batch_start in range(0, len(eligible_keys), _PARENT_BATCH_SIZE):
+            batch = eligible_keys[batch_start : batch_start + _PARENT_BATCH_SIZE]
+            worked_subtasks = jira_client.search_jql(_build_sibling_work_jql(batch))
+            for parent_key in batch:
+                rt_key = parent_to_rt_key[parent_key]
+                if _parent_excluded_for_worked_on_siblings(
+                    jira_client,
+                    settings,
+                    parent_key,
+                    rt_key,
+                    worked_subtasks,
+                ):
+                    excluded_parents.add(parent_key)
 
-    final_parent_keys = [
-        key for key in parent_keys if key not in excluded_parents
-    ]
+    passing_parents = {
+        key
+        for key in status_filtered_keys
+        if key not in excluded_parents and key in parent_to_rt_key
+    }
 
-    # Fetch assignee display names for the final parents (batched).
-    parent_to_assignee: dict[str, str] = {}
-    for batch_start in range(0, len(final_parent_keys), _PARENT_BATCH_SIZE):
-        batch = final_parent_keys[batch_start : batch_start + _PARENT_BATCH_SIZE]
-        if not batch:
-            continue
-        keys_csv = ", ".join(batch)
-        parent_jql = f"key in ({keys_csv})"
-        parent_issues = client.search_jql(parent_jql)
-        for parent_issue in parent_issues:
-            if parent_issue.key in batch:
-                display_name = parent_issue.assignee_display_name or "Unassigned"
-                parent_to_assignee[parent_issue.key] = display_name
-
-    # Build results and sort by last completed subtask date (oldest first).
-    # Parents with no resolution date (None) are placed after those with dates.
     results: list[ParentReadyForRt] = []
-    for key in final_parent_keys:
-        assignee = parent_to_assignee.get(key, "Unassigned")
-        last_completed = parent_to_last_completed.get(key)
+    for parent_key, pull_request in resolved_pairs:
+        if parent_key not in passing_parents:
+            continue
         results.append(
             ParentReadyForRt(
-                key=key,
-                assignee=assignee,
-                last_subtask_completed=last_completed,
+                key=parent_key,
+                assignee=parent_to_assignee.get(parent_key, "Unassigned"),
+                pull_request_url=pull_request.html_url,
+                pull_request_created_at=pull_request.created_at,
+                parent_updated_at=parent_to_updated_at.get(parent_key),
             )
         )
 
-    results.sort(key=lambda item: (item.last_subtask_completed is None, item.last_subtask_completed))
-    return results
+    results.sort(
+        key=lambda item: (
+            item.pull_request_created_at,
+            item.parent_updated_at or _SORT_UNKNOWN_JIRA_UPDATED,
+        )
+    )
+    return QueueBuildResult(
+        entries=results,
+        skipped_unresolved_pr_count=skipped_unresolved,
+    )
