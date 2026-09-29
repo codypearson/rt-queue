@@ -18,6 +18,12 @@ from rt_queue.github_client import GitHubPullRequest
 # when the issue was created as a Sub-task instead of the Deploy type.
 DEPLOY_SUMMARY = "deploy"
 
+# Status name used when resolving who moved an issue to Done from changelog history.
+DONE_STATUS_NAME = "done"
+
+# Maximum issue keys per ``POST /rest/api/3/changelog/bulkfetch`` request.
+_BULK_CHANGELOG_MAX_ISSUES = 1000
+
 # Jira issue keys: PROJECT-123 (project key starts with a letter).
 JIRA_KEY_PATTERN = re.compile(r"\b([A-Za-z][A-Za-z0-9]+-\d+)\b")
 # PR titles like "Eng3 378" without a hyphen.
@@ -412,6 +418,86 @@ class JiraClient:
 
         return out
 
+    def get_latest_done_by_for_issues(
+        self, issues: list[JiraIssue]
+    ) -> dict[str, str]:
+        """
+        Return who last moved each issue to Done, keyed by issue key.
+
+        Uses bulk status changelog fetch. Issues without a matching history
+        entry map to ``Unknown``.
+        """
+        if not issues:
+            return {}
+
+        key_to_issue_id: dict[str, str] = {}
+        for issue in issues:
+            if issue.issue_id:
+                key_to_issue_id[issue.key] = issue.issue_id
+
+        issue_ids = list(dict.fromkeys(key_to_issue_id.values()))
+        histories_by_issue_id = self._fetch_status_changelogs_by_issue_id(issue_ids)
+
+        done_by_by_key: dict[str, str] = {}
+        for issue_key, issue_id in key_to_issue_id.items():
+            histories = histories_by_issue_id.get(issue_id, [])
+            done_by_by_key[issue_key] = latest_done_by_from_changelog_histories(
+                histories
+            )
+
+        for issue in issues:
+            if issue.key not in done_by_by_key:
+                done_by_by_key[issue.key] = "Unknown"
+
+        return done_by_by_key
+
+    def _fetch_status_changelogs_by_issue_id(
+        self, issue_ids: list[str]
+    ) -> dict[str, list[dict[str, Any]]]:
+        """
+        Fetch status field changelogs for issue ids (paginated, merged per issue).
+
+        Returns a map of Jira issue id to merged ``changeHistories`` entries.
+        """
+        merged: dict[str, list[dict[str, Any]]] = {}
+        if not issue_ids:
+            return merged
+
+        url = f"{self._base}/rest/api/3/changelog/bulkfetch"
+        for batch_start in range(0, len(issue_ids), _BULK_CHANGELOG_MAX_ISSUES):
+            batch = issue_ids[batch_start : batch_start + _BULK_CHANGELOG_MAX_ISSUES]
+            next_page_token: str | None = None
+
+            while True:
+                body: dict[str, Any] = {
+                    "issueIdsOrKeys": batch,
+                    "fieldIds": ["status"],
+                    "maxResults": 1000,
+                }
+                if next_page_token:
+                    body["nextPageToken"] = next_page_token
+
+                resp = self._session.post(url, json=body, timeout=120)
+                resp.raise_for_status()
+                data = resp.json()
+
+                for issue_log in data.get("issueChangeLogs") or []:
+                    if not isinstance(issue_log, dict):
+                        continue
+                    issue_id = str(issue_log.get("issueId") or "").strip()
+                    if not issue_id:
+                        continue
+                    histories = issue_log.get("changeHistories") or []
+                    if not isinstance(histories, list):
+                        continue
+                    merged.setdefault(issue_id, []).extend(histories)
+
+                next_page_token = data.get("nextPageToken")
+                if not next_page_token:
+                    break
+
+        return merged
+
     def _map_issue(self, issue: dict[str, Any]) -> JiraIssue:
         fields = issue.get("fields") or {}
         key = (issue.get("key") or "").strip()
@@ -518,3 +604,93 @@ def assignee_is_current_user(issue: JiraIssue, current_account_id: str) -> bool:
     if not issue.assignee_account_id:
         return False
     return issue.assignee_account_id == current_account_id
+
+
+def _changelog_created_at(created: Any) -> dt.datetime | None:
+    """
+    Parse a changelog ``created`` value.
+
+    Jira bulk changelog often returns Unix epoch milliseconds as a number or
+    digit string; other endpoints may use seconds or ISO-8601 strings.
+    """
+    if created is None:
+        return None
+
+    numeric_value: float | None = None
+    if isinstance(created, (int, float)):
+        numeric_value = float(created)
+    elif isinstance(created, str):
+        stripped = created.strip()
+        if stripped.isdigit():
+            numeric_value = float(stripped)
+
+    if numeric_value is not None:
+        try:
+            epoch_seconds = numeric_value
+            # Values above ~year 5138 in seconds are millisecond timestamps.
+            if epoch_seconds > 1e11:
+                epoch_seconds = epoch_seconds / 1000.0
+            return dt.datetime.fromtimestamp(epoch_seconds, tz=dt.timezone.utc)
+        except (OSError, OverflowError, ValueError):
+            return None
+
+    return parse_api_datetime(created)
+
+
+def _change_item_transitions_to_done(item: dict[str, Any]) -> bool:
+    """True when a changelog item is a status change into Done."""
+    field = (item.get("field") or "").strip().lower()
+    field_id = (item.get("fieldId") or "").strip().lower()
+    if field != "status" and field_id != "status":
+        return False
+    to_string = (item.get("toString") or "").strip().lower()
+    return to_string == DONE_STATUS_NAME
+
+
+def _history_transitions_to_done(history: dict[str, Any]) -> bool:
+    """True when a changelog history entry includes a transition to Done."""
+    items = history.get("items")
+    if not isinstance(items, list):
+        return False
+    return any(
+        isinstance(item, dict) and _change_item_transitions_to_done(item)
+        for item in items
+    )
+
+
+def _author_display_name_from_history(history: dict[str, Any]) -> str | None:
+    """Return the changelog author's display name when present."""
+    author = history.get("author")
+    if not isinstance(author, dict):
+        return None
+    display_name = (author.get("displayName") or "").strip()
+    return display_name or None
+
+
+def latest_done_by_from_changelog_histories(
+    histories: list[dict[str, Any]],
+) -> str:
+    """
+    Return the display name of who last moved the issue to Done.
+
+    When the issue was reopened, the latest transition to Done wins. Returns
+    ``Unknown`` when no Done transition exists or the author has no display name.
+    """
+    best_created: dt.datetime | None = None
+    best_author: str | None = None
+
+    for history in histories:
+        if not isinstance(history, dict):
+            continue
+        if not _history_transitions_to_done(history):
+            continue
+        created_at = _changelog_created_at(history.get("created"))
+        if created_at is None:
+            continue
+        if best_created is None or created_at > best_created:
+            best_created = created_at
+            best_author = _author_display_name_from_history(history)
+
+    if best_author:
+        return best_author
+    return "Unknown"

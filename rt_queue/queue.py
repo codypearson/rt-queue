@@ -20,19 +20,28 @@ from rt_queue.jira_client import (
 
 
 @dataclass(frozen=True)
+class CompletedSubtaskReport:
+    """A completed work subtask and who last moved it to Done."""
+
+    key: str
+    summary: str
+    done_by: str
+
+
+@dataclass(frozen=True)
 class ParentReadyForRt:
     """A parent issue that is ready for Review & Test, tied to one pull request.
 
     Attributes:
         key: The Jira issue key (e.g. PROJ-123).
-        assignee: Display name of the parent assignee, or "Unassigned".
+        completed_subtasks: Done work siblings (excludes R&T, Deploy, ignored).
         pull_request_url: GitHub pull request URL that sourced this queue entry.
         pull_request_created_at: When the pull request was opened on GitHub.
         parent_updated_at: When the parent issue was last updated in Jira, if known.
     """
 
     key: str
-    assignee: str
+    completed_subtasks: tuple[CompletedSubtaskReport, ...]
     pull_request_url: str
     pull_request_created_at: dt.datetime
     parent_updated_at: dt.datetime | None
@@ -124,6 +133,36 @@ def siblings_ready_for_rt(
     return True
 
 
+def completed_work_subtasks_for_parent(
+    client: JiraClient,
+    settings: Settings,
+    parent_key: str,
+    rt_subtask_key: str,
+    siblings: list[JiraIssue],
+) -> list[JiraIssue]:
+    """
+    Return Done siblings that count as completed work for reporting.
+
+    Uses the same inclusion rules as ``siblings_ready_for_rt`` (non-Deploy,
+    non-ignored, not the open R&T subtask). Only issues in Done status are
+    returned.
+    """
+    completed: list[JiraIssue] = []
+    for subtask in siblings:
+        if not _child_belongs_to_parent(subtask, parent_key):
+            continue
+        if subtask.key == rt_subtask_key:
+            continue
+        if _is_ignored_subtask(subtask, settings):
+            continue
+        if client.is_deploy_subtask(subtask):
+            continue
+        if not is_done_status(subtask):
+            continue
+        completed.append(subtask)
+    return completed
+
+
 def _parent_excluded_for_worked_on_siblings(
     client: JiraClient,
     settings: Settings,
@@ -156,6 +195,8 @@ def _parent_excluded_for_worked_on_siblings(
 
 # Sort parents with unknown Jira ``updated`` after those with a known timestamp.
 _SORT_UNKNOWN_JIRA_UPDATED = dt.datetime.max.replace(tzinfo=dt.timezone.utc)
+# Sort subtasks with unknown resolution after those with a known timestamp.
+_SORT_UNKNOWN_RESOLUTION = dt.datetime.max.replace(tzinfo=dt.timezone.utc)
 
 
 @dataclass(frozen=True)
@@ -217,10 +258,9 @@ def find_parents_needing_rt(
             if parent_issue.key in batch:
                 parent_issues_by_key[parent_issue.key] = parent_issue
 
-    qualifying_parent_keys: set[str] = set()
-    parent_to_assignee: dict[str, str] = {}
     parent_to_updated_at: dict[str, dt.datetime | None] = {}
     parent_to_rt_key: dict[str, str] = {}
+    parent_to_completed_issues: dict[str, list[JiraIssue]] = {}
 
     status_filtered_keys: list[str] = []
     for parent_key in unique_parent_keys:
@@ -230,8 +270,6 @@ def find_parents_needing_rt(
         if not status_matches(parent_issue, settings.jira_parent_status_name):
             continue
         status_filtered_keys.append(parent_key)
-        display_name = parent_issue.assignee_display_name or "Unassigned"
-        parent_to_assignee[parent_key] = display_name
         parent_to_updated_at[parent_key] = parent_issue.updated_at
 
     if not status_filtered_keys:
@@ -262,6 +300,9 @@ def find_parents_needing_rt(
             ):
                 excluded_parents.add(parent_key)
                 continue
+            parent_to_completed_issues[parent_key] = completed_work_subtasks_for_parent(
+                jira_client, settings, parent_key, rt_key, all_siblings
+            )
 
     if exclude_worked_on_siblings:
         eligible_keys = [
@@ -289,6 +330,33 @@ def find_parents_needing_rt(
         if key not in excluded_parents and key in parent_to_rt_key
     }
 
+    unique_completed_issues: dict[str, JiraIssue] = {}
+    for parent_key in passing_parents:
+        for subtask in parent_to_completed_issues.get(parent_key, []):
+            unique_completed_issues[subtask.key] = subtask
+
+    done_by_by_subtask_key = jira_client.get_latest_done_by_for_issues(
+        list(unique_completed_issues.values())
+    )
+
+    def build_completed_reports(parent_key: str) -> tuple[CompletedSubtaskReport, ...]:
+        subtasks = parent_to_completed_issues.get(parent_key, [])
+        sorted_subtasks = sorted(
+            subtasks,
+            key=lambda issue: (
+                issue.resolution_date or _SORT_UNKNOWN_RESOLUTION,
+                issue.key,
+            ),
+        )
+        return tuple(
+            CompletedSubtaskReport(
+                key=issue.key,
+                summary=issue.summary,
+                done_by=done_by_by_subtask_key.get(issue.key, "Unknown"),
+            )
+            for issue in sorted_subtasks
+        )
+
     results: list[ParentReadyForRt] = []
     for parent_key, pull_request in resolved_pairs:
         if parent_key not in passing_parents:
@@ -296,7 +364,7 @@ def find_parents_needing_rt(
         results.append(
             ParentReadyForRt(
                 key=parent_key,
-                assignee=parent_to_assignee.get(parent_key, "Unassigned"),
+                completed_subtasks=build_completed_reports(parent_key),
                 pull_request_url=pull_request.html_url,
                 pull_request_created_at=pull_request.created_at,
                 parent_updated_at=parent_to_updated_at.get(parent_key),

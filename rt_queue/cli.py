@@ -1,7 +1,8 @@
 """Command-line entry: print parent tickets ready for Review & Test.
 
-Output includes the browse URL, parent assignee, and GitHub pull request URL
-(sorted oldest PR first, then oldest Jira parent update).
+Output includes the parent browse URL, GitHub pull request URL, and each
+completed work subtask with who last moved it to Done (sorted oldest PR first,
+then oldest Jira parent update).
 """
 
 from __future__ import annotations
@@ -46,7 +47,7 @@ worked-on-sibling exclusion.
 @click.command(
     help=(
         "Print parent tickets ready for Review & Test "
-        "(URL, assignee, PR URL)."
+        "(URL, PR URL, completed subtasks with Done by)."
     ),
     epilog=EPILOG,
 )
@@ -94,9 +95,11 @@ def main(include_worked_on: bool) -> None:
 
     for parent in parents:
         url = jira_client.issue_url(parent.key)
-        click.echo(
-            f"{url}  (Assignee: {parent.assignee}, PR: {parent.pull_request_url})"
-        )
+        click.echo(f"{url}  (PR: {parent.pull_request_url})")
+        for subtask in parent.completed_subtasks:
+            click.echo(
+                f"  {subtask.key}  {subtask.summary}  — Done by: {subtask.done_by}"
+            )
 
     if not parents:
         click.echo(
