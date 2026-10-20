@@ -34,6 +34,7 @@ class ParentReadyForRt:
 
     Attributes:
         key: The Jira issue key (e.g. PROJ-123).
+        summary: The parent issue summary (title).
         completed_subtasks: Done work siblings (excludes R&T, Deploy, ignored).
         pull_request_url: GitHub pull request URL that sourced this queue entry.
         pull_request_created_at: When the pull request was opened on GitHub.
@@ -41,6 +42,7 @@ class ParentReadyForRt:
     """
 
     key: str
+    summary: str
     completed_subtasks: tuple[CompletedSubtaskReport, ...]
     pull_request_url: str
     pull_request_created_at: dt.datetime
@@ -361,9 +363,11 @@ def find_parents_needing_rt(
     for parent_key, pull_request in resolved_pairs:
         if parent_key not in passing_parents:
             continue
+        parent_issue = parent_issues_by_key[parent_key]
         results.append(
             ParentReadyForRt(
                 key=parent_key,
+                summary=parent_issue.summary,
                 completed_subtasks=build_completed_reports(parent_key),
                 pull_request_url=pull_request.html_url,
                 pull_request_created_at=pull_request.created_at,

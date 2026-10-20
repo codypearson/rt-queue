@@ -19,7 +19,7 @@ CLI that scans configured GitHub repositories for open pull requests and prints 
 
 Ignored subtasks (default Stakeholder Review) are never a queue trigger, never a sibling blocker, and never disqualifying history.
 
-Output is one block per qualifying PR on stdout: parent URL and PR URL, then one indented line per completed work subtask (issue key, summary, and who last moved it to Done from Jira status history). Sorted by oldest pull request first, then oldest Jira parent update. Multiple PRs on the same parent produce multiple blocks.
+Output is one block per qualifying PR on stdout: parent URL, parent summary, and PR URL, then one indented line per completed work subtask (issue key, summary, and who last moved it to Done from Jira status history). Sorted by oldest pull request first, then oldest Jira parent update. Multiple PRs on the same parent produce multiple blocks.
 
 ## Setup
 
@@ -101,7 +101,7 @@ rt-queue --include-worked-on
 Example output:
 
 ```
-https://imh-internal.atlassian.net/browse/PROJ-123  (PR: https://github.com/inmotionhosting/product-catalog/pull/456)
+https://imh-internal.atlassian.net/browse/PROJ-123  Add widget to catalog  (PR: https://github.com/inmotionhosting/product-catalog/pull/456)
   PROJ-124  Implement the widget  — Done by: Jane Doe
   PROJ-125  Write tests  — Done by: Alex Kim
 ```
