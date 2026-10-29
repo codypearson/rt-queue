@@ -5,6 +5,10 @@ from __future__ import annotations
 import base64
 import datetime as dt
 import re
+import threading
+import time
+from collections.abc import Callable, Iterable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any
 
@@ -13,6 +17,11 @@ import requests
 from rt_queue.api_datetime import parse_api_datetime
 from rt_queue.config import Settings, SummaryKeywordGroups
 from rt_queue.github_client import GitHubPullRequest
+from rt_queue.jira_dev_summary import (
+    can_skip_dev_status_detail,
+    discover_development_field_id,
+)
+from rt_queue.single_flight import SingleFlightCache
 
 # Exact summary (case/whitespace-insensitive) treated as a Deploy sibling
 # when the issue was created as a Sub-task instead of the Deploy type.
@@ -23,6 +32,23 @@ DONE_STATUS_NAME = "done"
 
 # Maximum issue keys per ``POST /rest/api/3/changelog/bulkfetch`` request.
 _BULK_CHANGELOG_MAX_ISSUES = 1000
+
+# Shaped bulk issue fetch limits (see Jira ``/rest/api/3/issue/bulkfetch`` docs).
+_BULK_ISSUE_FETCH_MAX = 1000
+_BULK_ISSUE_FETCH_FALLBACK = 100
+_BULK_ISSUE_FIELD_NAMES = (
+    "summary",
+    "status",
+    "assignee",
+    "parent",
+    "issuetype",
+    "resolutiondate",
+    "updated",
+)
+_JQL_PAGE_SIZE = 100
+# Concurrent Jira reads. High enough that the per-issue probe fan-out overlaps
+# in a handful of round trips; 429/503 responses are retried.
+_PROBE_POOL_SIZE = 32
 
 # Jira issue keys: PROJECT-123 (project key starts with a letter).
 JIRA_KEY_PATTERN = re.compile(r"\b([A-Za-z][A-Za-z0-9]+-\d+)\b")
@@ -111,6 +137,8 @@ def extract_jira_keys_from_pull_request(
         parts.append(pull_request.head_ref)
     if commit_messages:
         parts.extend(commit_messages)
+    elif pull_request.commit_messages:
+        parts.extend(pull_request.commit_messages)
 
     combined = "\n".join(parts)
     return extract_jira_keys(combined)
@@ -154,6 +182,75 @@ class JiraClient:
         )
         self._base = settings.jira_base_url.rstrip("/")
         self._myself_account_id: str | None = None
+        self._issues_by_key: dict[str, JiraIssue] = {}
+        self._development_field_values: dict[str, Any] = {}
+        self._development_field_id: str | None = None
+        self._development_field_discovered = False
+        self._thread_local = threading.local()
+        self._cache_lock = threading.Lock()
+        self._dev_detail_cache: SingleFlightCache[str, dict[str, Any] | None] = (
+            SingleFlightCache()
+        )
+        self._remote_links_cache: SingleFlightCache[str, list[dict[str, Any]]] = (
+            SingleFlightCache()
+        )
+        self._probe_pool = ThreadPoolExecutor(max_workers=_PROBE_POOL_SIZE)
+
+    def _http(self) -> requests.Session:
+        """Return a requests session private to the current thread."""
+        session = getattr(self._thread_local, "session", None)
+        if session is None:
+            session = requests.Session()
+            session.headers.update(self._session.headers)
+            self._thread_local.session = session
+        return session
+
+    def _send(self, method: str, url: str, **kwargs: Any) -> requests.Response:
+        """
+        Send an HTTP request, retrying rate-limit and unavailable responses.
+
+        Each attempt uses the calling thread's session so concurrent probes do
+        not share one connection pool.
+        """
+        kwargs.setdefault("timeout", 60)
+        response: requests.Response | None = None
+        for attempt in range(4):
+            response = self._http().request(method, url, **kwargs)
+            if response.status_code not in (429, 503) or attempt == 3:
+                return response
+            time.sleep(0.25 * (2**attempt))
+        if response is None:
+            raise RuntimeError(f"Jira {method} {url} produced no response")
+        return response
+
+    def _run_parallel(self, tasks: list[Callable[[], None]]) -> None:
+        """Run independent tasks on the probe pool and raise the first failure."""
+        if not tasks:
+            return
+        futures = [self._probe_pool.submit(task) for task in tasks]
+        first_error: BaseException | None = None
+        for future in futures:
+            try:
+                future.result()
+            except BaseException as exc:
+                if first_error is None:
+                    first_error = exc
+        if first_error is not None:
+            raise first_error
+
+    def prepare_for_queue(self) -> str:
+        """
+        Load the account id and Development field id concurrently.
+
+        Returns the current user's Atlassian account id.
+        """
+        field_future = self._probe_pool.submit(self._ensure_development_field_id)
+        account_future = self._probe_pool.submit(self.get_myself_account_id)
+        field_future.result()
+        account_id = account_future.result()
+        if not isinstance(account_id, str):
+            raise ValueError("Jira account id was not a string")
+        return account_id
 
     def issue_url(self, key: str) -> str:
         """Browse URL for an issue key."""
@@ -170,7 +267,7 @@ class JiraClient:
         if self._myself_account_id:
             return self._myself_account_id
         url = f"{self._base}/rest/api/3/myself"
-        resp = self._session.get(url, timeout=60)
+        resp = self._send("GET", url)
         resp.raise_for_status()
         data = resp.json()
         account_id = (data.get("accountId") or "").strip()
@@ -179,6 +276,240 @@ class JiraClient:
         self._myself_account_id = account_id
         return account_id
 
+    def get_loaded_issue(self, key: str) -> JiraIssue | None:
+        """Return a preloaded issue by key, or None when it was not loaded."""
+        normalized = key.strip().upper()
+        if not normalized:
+            return None
+        return self._issues_by_key.get(normalized)
+
+    def load_issues_for_keys(self, keys: Iterable[str]) -> None:
+        """
+        Bulk-load issues for the given keys and parent keys of loaded subtasks.
+
+        Missing or invalid keys are skipped without failing the run.
+        """
+        normalized_keys = self._normalize_issue_keys(keys)
+        self._bulk_fetch_missing_keys(normalized_keys)
+        self._bulk_fetch_parent_issues_for_subtasks()
+
+    def ensure_issues_loaded(self, keys: Iterable[str]) -> None:
+        """Bulk-fetch any of ``keys`` not already present in the preload cache."""
+        normalized_keys = self._normalize_issue_keys(keys)
+        missing = [
+            key
+            for key in normalized_keys
+            if key not in self._issues_by_key
+        ]
+        if missing:
+            self._bulk_fetch_missing_keys(missing)
+
+    def _normalize_issue_keys(self, keys: Iterable[str]) -> list[str]:
+        """Return de-duplicated uppercase issue keys preserving first-seen order."""
+        seen: set[str] = set()
+        ordered: list[str] = []
+        for raw_key in keys:
+            normalized = raw_key.strip().upper()
+            if not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            ordered.append(normalized)
+        return ordered
+
+    def _ensure_development_field_id(self) -> str | None:
+        """Discover and cache the Development custom field id once per client."""
+        if self._development_field_discovered:
+            return self._development_field_id
+        with self._cache_lock:
+            if self._development_field_discovered:
+                return self._development_field_id
+        url = f"{self._base}/rest/api/3/field"
+        resp = self._send("GET", url)
+        resp.raise_for_status()
+        payload = resp.json()
+        fields_list = payload if isinstance(payload, list) else []
+        with self._cache_lock:
+            self._development_field_id = discover_development_field_id(fields_list)
+            self._development_field_discovered = True
+            return self._development_field_id
+
+    def _bulk_fetch_fields(self) -> list[str]:
+        """Return explicit bulkfetch field names, including Development when known."""
+        field_names = list(_BULK_ISSUE_FIELD_NAMES)
+        development_field_id = self._ensure_development_field_id()
+        if development_field_id:
+            field_names.append(development_field_id)
+        return field_names
+
+    def _bulk_fetch_missing_keys(self, keys: list[str]) -> None:
+        """POST bulkfetch for keys not already cached."""
+        if not keys:
+            return
+        pending = [key for key in keys if key not in self._issues_by_key]
+        if not pending:
+            return
+
+        field_names = self._bulk_fetch_fields()
+        batch_size = _BULK_ISSUE_FETCH_MAX
+        for batch_start in range(0, len(pending), batch_size):
+            batch = pending[batch_start : batch_start + batch_size]
+            try:
+                self._post_bulk_fetch(batch, field_names)
+            except requests.HTTPError as exc:
+                if (
+                    exc.response is not None
+                    and exc.response.status_code == 400
+                    and batch_size > _BULK_ISSUE_FETCH_FALLBACK
+                ):
+                    for small_start in range(
+                        0, len(batch), _BULK_ISSUE_FETCH_FALLBACK
+                    ):
+                        small_batch = batch[
+                            small_start : small_start + _BULK_ISSUE_FETCH_FALLBACK
+                        ]
+                        self._post_bulk_fetch(small_batch, field_names)
+                else:
+                    raise
+
+    def _post_bulk_fetch(self, keys: list[str], field_names: list[str]) -> None:
+        """Execute one bulkfetch request, retrying once on retriable errors."""
+        url = f"{self._base}/rest/api/3/issue/bulkfetch"
+        body = {
+            "issueIdsOrKeys": keys,
+            "fields": field_names,
+            "fieldsByKeys": False,
+        }
+        data = self._post_json_with_retry(url, body)
+        development_field_id = self._development_field_id
+        for issue_json in data.get("issues") or []:
+            if isinstance(issue_json, dict):
+                self._store_preloaded_issue(issue_json, development_field_id)
+        for issue_error in data.get("issueErrors") or []:
+            if not isinstance(issue_error, dict):
+                continue
+            message = (
+                issue_error.get("errorMessage")
+                or issue_error.get("message")
+                or ""
+            ).strip()
+            if self._issue_error_is_not_found(message):
+                continue
+            raise ValueError(
+                f"Jira bulkfetch failed for an issue: {message or issue_error}"
+            )
+
+        missing_keys = [
+            requested_key
+            for requested_key in keys
+            if requested_key.strip().upper() not in self._issues_by_key
+        ]
+        self._run_parallel(
+            [
+                (
+                    lambda requested_key=requested_key: self._preload_issue_via_get(
+                        requested_key
+                    )
+                )
+                for requested_key in missing_keys
+            ]
+        )
+
+    def _preload_issue_via_get(self, key: str) -> None:
+        """
+        Load one issue through GET when bulkfetch did not map the requested key.
+
+        Bulkfetch may resolve moved keys to a different ``issue.key`` than the
+        key that was requested. GET by the requested key preserves lookup by
+        text extracted from pull requests.
+        """
+        development_field_id = self._ensure_development_field_id()
+        field_names = list(_BULK_ISSUE_FIELD_NAMES)
+        if development_field_id:
+            field_names.append(development_field_id)
+        fields_param = ",".join(field_names)
+        url = f"{self._base}/rest/api/3/issue/{key}"
+        resp = self._send("GET", url, params={"fields": fields_param})
+        if resp.status_code == 404:
+            return
+        resp.raise_for_status()
+        issue_json = resp.json()
+        if not isinstance(issue_json, dict):
+            return
+        self._store_preloaded_issue(
+            issue_json,
+            development_field_id,
+            alias_keys=(key.strip().upper(),),
+        )
+
+    def _post_json_with_retry(
+        self, url: str, body: dict[str, Any]
+    ) -> dict[str, Any]:
+        """POST JSON to Jira, retrying once on HTTP errors."""
+        last_error: requests.HTTPError | None = None
+        for _attempt in range(2):
+            resp = self._send("POST", url, json=body, timeout=120)
+            if resp.ok:
+                payload = resp.json()
+                if isinstance(payload, dict):
+                    return payload
+                raise ValueError("Jira response was not a JSON object")
+            last_error = requests.HTTPError(
+                f"{resp.status_code} Client Error for {url}", response=resp
+            )
+            if resp.status_code >= 500:
+                continue
+            resp.raise_for_status()
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError("Jira POST failed without a response")
+
+    @staticmethod
+    def _issue_error_is_not_found(message: str) -> bool:
+        """True when a bulkfetch issue error indicates a missing issue key."""
+        lowered = message.lower()
+        return "not found" in lowered or "does not exist" in lowered
+
+    def _store_preloaded_issue(
+        self,
+        issue_json: dict[str, Any],
+        development_field_id: str | None,
+        *,
+        alias_keys: tuple[str, ...] = (),
+    ) -> None:
+        """Map and cache one issue payload under its key and optional aliases."""
+        issue = self._map_issue(issue_json)
+        if not issue.key:
+            return
+        normalized_key = issue.key.upper()
+        dev_value: Any = None
+        if development_field_id:
+            fields = issue_json.get("fields") or {}
+            if isinstance(fields, dict):
+                dev_value = fields.get(development_field_id)
+        with self._cache_lock:
+            self._issues_by_key[normalized_key] = issue
+            if development_field_id:
+                self._development_field_values[normalized_key] = dev_value
+            for alias in alias_keys:
+                alias_normalized = alias.strip().upper()
+                if not alias_normalized:
+                    continue
+                self._issues_by_key[alias_normalized] = issue
+                if development_field_id:
+                    self._development_field_values[alias_normalized] = dev_value
+
+    def _bulk_fetch_parent_issues_for_subtasks(self) -> None:
+        """Bulk-load parent issues for any cached subtasks missing parents."""
+        parent_keys: list[str] = []
+        for issue in self._issues_by_key.values():
+            if not issue.is_subtask or not issue.parent_key:
+                continue
+            parent_normalized = issue.parent_key.upper()
+            if parent_normalized not in self._issues_by_key:
+                parent_keys.append(parent_normalized)
+        if parent_keys:
+            self._bulk_fetch_missing_keys(self._normalize_issue_keys(parent_keys))
+
     def get_issue(self, key: str) -> JiraIssue | None:
         """
         Fetch a single issue by key.
@@ -186,19 +517,70 @@ class JiraClient:
         Returns None when the issue does not exist (404).
         """
         url = f"{self._base}/rest/api/3/issue/{key}"
-        resp = self._session.get(
+        resp = self._send(
+            "GET",
             url,
             params={
                 "fields": (
                     "summary,status,assignee,parent,issuetype,resolutiondate,updated"
                 )
             },
-            timeout=60,
         )
         if resp.status_code == 404:
             return None
         resp.raise_for_status()
         return self._map_issue(resp.json())
+
+    def prefetch_link_evidence_for_keys(self, keys: Iterable[str]) -> None:
+        """
+        Load development-panel detail and remote links for preloaded candidates.
+
+        One HTTP call is issued per distinct issue, and those calls run together.
+        Later parent resolution reads the cached payloads.
+        """
+        tasks: list[Callable[[], None]] = []
+        seen: set[str] = set()
+        for key in self._normalize_issue_keys(keys):
+            issue = self.get_loaded_issue(key)
+            if issue is None:
+                continue
+            identity = (issue.issue_id or issue.key).upper()
+            if identity in seen:
+                continue
+            seen.add(identity)
+            tasks.append(
+                lambda issue_key=issue.key: self._load_remote_links(issue_key)
+            )
+            if self._dev_detail_required(issue):
+                tasks.append(lambda issue=issue: self._load_dev_detail(issue))
+        self._run_parallel(tasks)
+
+    def _dev_detail_required(self, issue: JiraIssue) -> bool:
+        """True when dev-status detail must be fetched for ``issue``."""
+        if not issue.issue_id:
+            return False
+        field_value = self._development_field_values.get(issue.key.upper())
+        return not can_skip_dev_status_detail(field_value)
+
+    def _load_remote_links(self, issue_key: str) -> None:
+        """Populate the remote-link cache for one issue key."""
+        normalized_key = issue_key.strip().upper()
+        if not normalized_key:
+            return
+        self._remote_links_cache.get_or_fetch(
+            normalized_key,
+            lambda: self._fetch_remote_links(normalized_key),
+        )
+
+    def _load_dev_detail(self, issue: JiraIssue) -> None:
+        """Populate the dev-status detail cache for one issue."""
+        if not issue.issue_id:
+            return
+        issue_id = issue.issue_id
+        self._dev_detail_cache.get_or_fetch(
+            issue_id,
+            lambda: self._fetch_dev_detail_payload(issue),
+        )
 
     def resolve_parent_for_pull_request(
         self,
@@ -212,41 +594,67 @@ class JiraClient:
         link). Among matches, prefer a key appearing in the PR title, then a
         non-subtask. If no issue shows the PR, fall back to the first key in
         the title only. Subtask matches are promoted to their parent key.
-        Returns None when no parent can be resolved.
+
+        Requires issues to be preloaded via ``load_issues_for_keys``.
         """
+        if commit_messages is None:
+            message_list: list[str] | None = None
+        else:
+            message_list = commit_messages
+
         candidate_keys = extract_jira_keys_from_pull_request(
-            pull_request, commit_messages
+            pull_request, message_list
         )
         title_keys = extract_jira_keys(pull_request.title)
         title_key_set = set(title_keys)
 
-        linked_matches: list[tuple[JiraIssue, bool, bool]] = []
-
-        for key in candidate_keys:
-            issue = self.get_issue(key)
-            if issue is None:
-                continue
-            if not self._issue_shows_pull_request(issue, pull_request):
-                continue
-            in_title = issue.key.upper() in title_key_set
-            linked_matches.append((issue, in_title, issue.is_subtask))
-
-        if linked_matches:
-            linked_matches.sort(
-                key=lambda item: (
-                    not item[1],
-                    item[2],
-                )
-            )
-            return self._parent_key_for_issue(linked_matches[0][0])
+        linked_parent = self._resolve_linked_parent_by_rank(
+            pull_request,
+            candidate_keys,
+            title_key_set,
+        )
+        if linked_parent is not None:
+            return linked_parent
 
         title_fallback = extract_first_jira_key_from_title(pull_request.title)
         if title_fallback is None:
             return None
-        issue = self.get_issue(title_fallback)
+        issue = self.get_loaded_issue(title_fallback)
         if issue is None:
             return None
         return self._parent_key_for_issue(issue)
+
+    def _resolve_linked_parent_by_rank(
+        self,
+        pull_request: GitHubPullRequest,
+        candidate_keys: tuple[str, ...],
+        title_key_set: set[str],
+    ) -> str | None:
+        """
+        Walk candidate keys in rank order and return the first linked parent.
+
+        Rank groups mirror the legacy sort on ``(in_title, is_subtask)`` with
+        early exit after a matching in-title subtask (non-title keys skipped).
+        """
+        rank_groups: tuple[tuple[bool, bool], ...] = (
+            (True, False),
+            (True, True),
+            (False, False),
+            (False, True),
+        )
+        for in_title, is_subtask in rank_groups:
+            for key in candidate_keys:
+                issue = self.get_loaded_issue(key)
+                if issue is None:
+                    continue
+                if (issue.key.upper() in title_key_set) != in_title:
+                    continue
+                if issue.is_subtask != is_subtask:
+                    continue
+                if not self._issue_shows_pull_request(issue, pull_request):
+                    continue
+                return self._parent_key_for_issue(issue)
+        return None
 
     def _parent_key_for_issue(self, issue: JiraIssue) -> str:
         """Return the parent issue key, walking up from a subtask when needed."""
@@ -268,27 +676,40 @@ class JiraClient:
         """
         Check Jira development status for a linked GitHub pull request.
 
-        Uses ``/rest/dev-status/1.0/issue/detail``. Returns False on 403/404
-        or when the issue has no id.
+        Skips the detail endpoint when the Development field summary is fresh
+        and reports zero pull requests.
         """
-        if not issue.issue_id:
+        if not self._dev_detail_required(issue):
             return False
+        issue_id = issue.issue_id
+        if issue_id is None:
+            return False
+        payload = self._dev_detail_cache.get_or_fetch(
+            issue_id,
+            lambda: self._fetch_dev_detail_payload(issue),
+        )
+        if not isinstance(payload, dict):
+            return False
+        return self._dev_status_payload_matches_pr(payload, pull_request)
+
+    def _fetch_dev_detail_payload(self, issue: JiraIssue) -> dict[str, Any] | None:
+        """Call dev-status detail and return the JSON payload, or None."""
         url = f"{self._base}/rest/dev-status/1.0/issue/detail"
         params = {
             "issueId": issue.issue_id,
             "applicationType": "github",
             "dataType": "pullrequest",
         }
-        resp = self._session.get(url, params=params, timeout=60)
-        if resp.status_code in (403, 404):
-            return False
-        if not resp.ok:
-            return False
+        resp = self._send("GET", url, params=params)
+        if resp.status_code in (403, 404) or not resp.ok:
+            return None
         try:
             data = resp.json()
         except ValueError:
-            return False
-        return self._dev_status_payload_matches_pr(data, pull_request)
+            return None
+        if not isinstance(data, dict):
+            return None
+        return data
 
     def _dev_status_payload_matches_pr(
         self, data: Any, pull_request: GitHubPullRequest
@@ -347,25 +768,39 @@ class JiraClient:
         self, issue_key: str, pull_request: GitHubPullRequest
     ) -> bool:
         """True when remote links on the issue include this PR URL."""
+        normalized_key = issue_key.strip().upper()
+        if not normalized_key:
+            return False
+        links = self._remote_links_cache.get_or_fetch(
+            normalized_key,
+            lambda: self._fetch_remote_links(normalized_key),
+        )
+        return self._remote_links_payload_includes_pull_request(links, pull_request)
+
+    def _fetch_remote_links(self, issue_key: str) -> list[dict[str, Any]]:
+        """Fetch remote web links for one issue (uncached HTTP)."""
         url = f"{self._base}/rest/api/3/issue/{issue_key}/remotelink"
-        resp = self._session.get(url, timeout=60)
+        resp = self._send("GET", url)
         if resp.status_code == 404:
-            return False
+            return []
         if not resp.ok:
-            return False
+            return []
         try:
             links = resp.json()
         except ValueError:
-            return False
+            return []
         if not isinstance(links, list):
-            return False
+            return []
+        return [link for link in links if isinstance(link, dict)]
 
+    def _remote_links_payload_includes_pull_request(
+        self, links: list[dict[str, Any]], pull_request: GitHubPullRequest
+    ) -> bool:
+        """Return True when ``links`` includes the pull request URL."""
         pr_url = pull_request.html_url
         pr_url_alt = f"{pr_url}/"
 
         for link in links:
-            if not isinstance(link, dict):
-                continue
             object_info = link.get("object") or {}
             if not isinstance(object_info, dict):
                 continue
@@ -383,7 +818,7 @@ class JiraClient:
         Requests summary, status, assignee, parent, issuetype, resolutiondate, and updated.
         """
         url = f"{self._base}/rest/api/3/search/jql"
-        page_size = 50
+        page_size = _JQL_PAGE_SIZE
         out: list[JiraIssue] = []
         next_page_token: str | None = None
 
@@ -403,7 +838,7 @@ class JiraClient:
             }
             if next_page_token:
                 body["nextPageToken"] = next_page_token
-            resp = self._session.post(url, json=body, timeout=60)
+            resp = self._send("POST", url, json=body)
             resp.raise_for_status()
             data = resp.json()
             for issue in data.get("issues") or []:
@@ -477,7 +912,7 @@ class JiraClient:
                 if next_page_token:
                     body["nextPageToken"] = next_page_token
 
-                resp = self._session.post(url, json=body, timeout=120)
+                resp = self._send("POST", url, json=body, timeout=120)
                 resp.raise_for_status()
                 data = resp.json()
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime as dt
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
 from rt_queue.config import Settings
@@ -11,6 +12,7 @@ from rt_queue.jira_client import (
     JiraClient,
     JiraIssue,
     assignee_is_current_user,
+    extract_jira_keys_from_pull_request,
     format_jql_issue_keys,
     is_done_status,
     status_matches,
@@ -50,7 +52,7 @@ class ParentReadyForRt:
 
 
 # Batch size for ``parent in (...)`` JQL queries.
-_PARENT_BATCH_SIZE = 50
+_PARENT_BATCH_SIZE = 100
 
 
 def _is_ignored_subtask(subtask: JiraIssue, settings: Settings) -> bool:
@@ -229,19 +231,27 @@ def find_parents_needing_rt(
     Results are sorted by pull request creation time (oldest first), then parent
     issue updated time (oldest first).
     """
-    current_account_id = jira_client.get_myself_account_id()
-    pull_requests = github_client.list_open_pull_requests_not_by_me()
+    with ThreadPoolExecutor(max_workers=2) as startup_pool:
+        account_future = startup_pool.submit(jira_client.prepare_for_queue)
+        pull_request_future = startup_pool.submit(
+            github_client.list_open_pull_requests_not_by_me
+        )
+        current_account_id = account_future.result()
+        pull_requests = pull_request_future.result()
+
+    candidate_keys: list[str] = []
+    for pull_request in pull_requests:
+        candidate_keys.extend(
+            extract_jira_keys_from_pull_request(pull_request, None)
+        )
+    jira_client.load_issues_for_keys(candidate_keys)
+    jira_client.prefetch_link_evidence_for_keys(candidate_keys)
 
     resolved_pairs: list[tuple[str, GitHubPullRequest]] = []
     skipped_unresolved = 0
 
     for pull_request in pull_requests:
-        commit_messages = github_client.list_pull_request_commits(
-            pull_request.repository_full_name, pull_request.number
-        )
-        parent_key = jira_client.resolve_parent_for_pull_request(
-            pull_request, commit_messages
-        )
+        parent_key = jira_client.resolve_parent_for_pull_request(pull_request)
         if not parent_key:
             skipped_unresolved += 1
             continue
@@ -251,14 +261,13 @@ def find_parents_needing_rt(
         return QueueBuildResult(entries=[], skipped_unresolved_pr_count=skipped_unresolved)
 
     unique_parent_keys = list(dict.fromkeys(key for key, _ in resolved_pairs))
+    jira_client.ensure_issues_loaded(unique_parent_keys)
 
     parent_issues_by_key: dict[str, JiraIssue] = {}
-    for batch_start in range(0, len(unique_parent_keys), _PARENT_BATCH_SIZE):
-        batch = unique_parent_keys[batch_start : batch_start + _PARENT_BATCH_SIZE]
-        keys_csv = format_jql_issue_keys(batch)
-        for parent_issue in jira_client.search_jql(f"key in ({keys_csv})"):
-            if parent_issue.key in batch:
-                parent_issues_by_key[parent_issue.key] = parent_issue
+    for parent_key in unique_parent_keys:
+        parent_issue = jira_client.get_loaded_issue(parent_key)
+        if parent_issue is not None:
+            parent_issues_by_key[parent_key] = parent_issue
 
     parent_to_updated_at: dict[str, dt.datetime | None] = {}
     parent_to_rt_key: dict[str, str] = {}
