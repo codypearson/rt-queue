@@ -58,7 +58,7 @@ Run `rt-queue` from any directory; it loads `.env` from the current working dire
 
 #### GitHub token (`GITHUB_TOKEN`)
 
-The CLI calls `GET /user` (unless you set `GITHUB_LOGIN`), lists open pull requests per repo, and reads commit messages on each PR for Jira key extraction.
+The CLI uses GraphQL to list open pull requests and load commit messages in the same request. It also calls `GET /user` (unless you set `GITHUB_LOGIN`).
 
 **Fine-grained personal access token** (recommended for least privilege):
 
@@ -67,10 +67,11 @@ The CLI calls `GET /user` (unless you set `GITHUB_LOGIN`), lists open pull reque
 | Resource owner | Your org or user that owns the repos |
 | Repository access | **Only select repositories** — include every repo listed in `GITHUB_REPOSITORIES` |
 | Repository permissions → **Pull requests** | **Read** |
+| Repository permissions → **Contents** | **Read** (required for pull request commit messages in GraphQL) |
 | Repository permissions → **Metadata** | **Read** (required whenever other repo permissions are granted) |
 | Account permissions → **Profile** | **Read** (only if you omit `GITHUB_LOGIN`; used to learn your login so your own PRs are excluded) |
 
-No other repository or account permissions are required. You do not need Contents, Issues, or Actions access.
+No other repository or account permissions are required. You do not need Issues or Actions access.
 
 **Classic personal access token** alternative: grant the **`repo`** scope (or **`public_repo`** if every configured repository is public). Classic tokens cannot be limited to a subset of repositories the way fine-grained tokens can.
 
