@@ -193,7 +193,8 @@ class GitHubClient:
                                 current = collected[key]
                                 merged_messages = tuple(
                                     dict.fromkeys(
-                                        list(current.commit_messages) + extra_messages
+                                        list(current.commit_messages)
+                                        + list(extra_messages)
                                     )
                                 )
                                 collected[key] = GitHubPullRequest(
